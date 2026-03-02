@@ -455,6 +455,11 @@ LIVE_PKGS="debootstrap gdisk zfsutils-linux mdadm"
 apt-get install -y $LIVE_PKGS
 log_success "Utilities installed"
 
+# Stop any mdadm arrays that may hold partitions on the target disks
+log_info "Stopping active mdadm arrays (if any)..."
+mdadm --stop --scan 2>/dev/null || true
+udevadm settle --timeout=10
+
 ################################################################################
 # Step 2: Partition all selected disks
 #
@@ -474,6 +479,10 @@ log_success "Utilities installed"
 ################################################################################
 log_step "Step 2: Partitioning ${#DISKS[@]} disk(s)..."
 
+# ZFS root is partition 4 when swap is present, 3 when swap is disabled.
+# (Same numbering for both UEFI and BIOS modes.)
+[[ "$SWAP_SIZE" != "0" ]] && ZFS_PART_NUM=4 || ZFS_PART_NUM=3
+
 for i in "${!DISKS[@]}"; do
     DISK="${DISKS[$i]}"
     log_info "Partitioning $DISK..."
@@ -485,59 +494,92 @@ for i in "${!DISKS[@]}"; do
         PREF="${DISK}"
     fi
 
-    sgdisk --zap-all "$DISK"
+    # 1. Clear ALL existing filesystem and partition signatures so the kernel
+    #    releases any cached device-mapper / ZFS / mdadm references.
+    wipefs --all --force "$DISK" 2>/dev/null || true
+    udevadm settle --timeout=10
 
+    # 2. Zap the existing partition table.
+    sgdisk --zap-all "$DISK" 2>/dev/null || true
+    udevadm settle --timeout=10
+
+    # 3. Create ALL partitions in ONE sgdisk invocation.
+    #    A single call = a single kernel-notification request, which is far
+    #    more reliable than four separate calls on a previously-used disk.
+    #
+    #    BIOS note: -a1 sets 1-sector alignment for the BIOS boot stub only;
+    #    -a2048 resets to standard 1 MiB alignment for all subsequent parts.
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        sgdisk -n1:1M:+512M   -t1:EF00 "$DISK"   # EFI System Partition
-        sgdisk -n2:0:+2G      -t2:FD00 "$DISK"   # /boot (mdadm RAID1 member)
         if [[ "$SWAP_SIZE" != "0" ]]; then
-            sgdisk -n3:0:+"${SWAP_SIZE}" -t3:8200 "$DISK"   # encrypted swap
-            sgdisk -n4:0:0              -t4:BF00 "$DISK"   # ZFS root
+            sgdisk \
+                -n1:1M:+512M          -t1:EF00 \
+                -n2:0:+2G             -t2:FD00 \
+                -n3:0:+"${SWAP_SIZE}" -t3:8200 \
+                -n4:0:0               -t4:BF00 \
+                "$DISK"
             EFI_PARTS+=("${PREF}1")
             BOOT_PARTS+=("${PREF}2")
             SWAP_PARTS+=("${PREF}3")
             ROOT_PARTS+=("${PREF}4")
         else
-            sgdisk -n3:0:0 -t3:BF00 "$DISK"   # ZFS root
+            sgdisk \
+                -n1:1M:+512M -t1:EF00 \
+                -n2:0:+2G    -t2:FD00 \
+                -n3:0:0      -t3:BF00 \
+                "$DISK"
             EFI_PARTS+=("${PREF}1")
             BOOT_PARTS+=("${PREF}2")
             SWAP_PARTS+=("")
             ROOT_PARTS+=("${PREF}3")
         fi
     else
-        sgdisk -a1 -n1:24K:+1000K -t1:EF02 "$DISK"  # BIOS boot
-        sgdisk     -n2:0:+2G      -t2:FD00 "$DISK"  # /boot (mdadm RAID1 member)
         if [[ "$SWAP_SIZE" != "0" ]]; then
-            sgdisk -n3:0:+"${SWAP_SIZE}" -t3:8200 "$DISK"   # encrypted swap
-            sgdisk -n4:0:0              -t4:BF00 "$DISK"   # ZFS root
+            sgdisk \
+                -a1    -n1:24K:+1000K  -t1:EF02 \
+                -a2048 -n2:0:+2G       -t2:FD00 \
+                       -n3:0:+"${SWAP_SIZE}" -t3:8200 \
+                       -n4:0:0         -t4:BF00 \
+                "$DISK"
             BOOT_PARTS+=("${PREF}2")
             SWAP_PARTS+=("${PREF}3")
             ROOT_PARTS+=("${PREF}4")
         else
-            sgdisk -n3:0:0 -t3:BF00 "$DISK"   # ZFS root
+            sgdisk \
+                -a1    -n1:24K:+1000K -t1:EF02 \
+                -a2048 -n2:0:+2G      -t2:FD00 \
+                       -n3:0:0        -t3:BF00 \
+                "$DISK"
             BOOT_PARTS+=("${PREF}2")
             SWAP_PARTS+=("")
             ROOT_PARTS+=("${PREF}3")
         fi
     fi
 
+    # 4. Tell the kernel about the new layout and wait for udev to settle.
+    #    Fall back to blockdev --rereadpt if partprobe is insufficient.
+    partprobe "$DISK" 2>/dev/null || blockdev --rereadpt "$DISK" 2>/dev/null || true
+    udevadm settle --timeout=30
+
+    # 5. Wait (up to 30 s) for the last partition node to appear in /dev.
+    LAST_PART="${PREF}${ZFS_PART_NUM}"
+    for attempt in $(seq 1 15); do
+        [[ -b "$LAST_PART" ]] && break
+        log_info "Waiting for $LAST_PART (attempt $attempt/15)..."
+        sleep 2
+    done
+    if [[ ! -b "$LAST_PART" ]]; then
+        log_error "Partition $LAST_PART did not appear after partprobe!"
+        log_error "Try running the script again; if it persists, reboot the live USB."
+        exit 1
+    fi
+
     log_success "Disk $DISK partitioned"
 done
 
-# Show partition table of the first disk as reference
-sgdisk -p "${DISKS[0]}"
-sleep 2
-for DISK in "${DISKS[@]}"; do
-    partprobe "$DISK"
-done
-sleep 3
+# Show layout of the first disk for reference (read-only, no kernel side effects)
+lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL "${DISKS[0]}" || true
 
 # Resolve by-id paths for ZFS root partitions
-# ZFS root is part4 when swap is present, part3 when swap is disabled.
-[[ "$SWAP_SIZE" != "0" ]] && ZFS_PART_NUM=4 || ZFS_PART_NUM=3
-# BIOS mode has no EFI part so part numbers are the same
-# (bios_boot=1, boot=2, [swap=3,] zfs=3or4)
-
 for i in "${!DISKS[@]}"; do
     DISK_ID="${DISK_IDS[$i]}"
     if [[ "$DISK_ID" == /dev/disk/by-id/* ]]; then
