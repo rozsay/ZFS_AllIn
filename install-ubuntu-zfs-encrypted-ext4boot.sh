@@ -573,6 +573,18 @@ for i in "${!DISKS[@]}"; do
         exit 1
     fi
 
+    # 6. Stop any mdadm arrays the kernel may have auto-assembled from stale
+    #    superblocks still present in the partition data area (sgdisk --zap-all
+    #    only clears the GPT headers; the mdadm metadata=1.0 superblock lives at
+    #    the very end of the partition and survives).  Then wipe every newly
+    #    created partition's signatures so mkfs / mdadm --create start clean.
+    mdadm --stop --scan 2>/dev/null || true
+    for PNUM in $(seq 1 "${ZFS_PART_NUM}"); do
+        PDEV="${PREF}${PNUM}"
+        [[ -b "$PDEV" ]] && wipefs --all --force "$PDEV" 2>/dev/null || true
+    done
+    udevadm settle --timeout=10
+
     log_success "Disk $DISK partitioned"
 done
 
