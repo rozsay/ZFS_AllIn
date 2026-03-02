@@ -159,11 +159,33 @@ ask_yesno() {
 }
 
 ################################################################################
-# ZFS pool cleanup
+# Pre-installation teardown
+# Clears any state left by a previous (partial or full) run of this script,
+# in the correct dependency order:
+#   umount → close LUKS → zfs umount → zpool export/destroy → mdadm stop
 ################################################################################
-log_step "Checking for existing ZFS pools..."
-EXISTING_POOLS=$(zpool list -H -o name 2>/dev/null || true)
+log_step "Pre-installation teardown..."
 
+# 1. Unmount the entire /mnt hierarchy (chroot bind-mounts, ZFS datasets,
+#    /boot, /boot/efi from a previous run)
+log_info "Unmounting /mnt hierarchy..."
+umount -R /mnt/dev  2>/dev/null || true
+umount -R /mnt/proc 2>/dev/null || true
+umount -R /mnt/sys  2>/dev/null || true
+umount -R /mnt      2>/dev/null || true
+
+# 2. Close any open LUKS / dm-crypt swap mappers (cryptswap1, cryptswap2, …)
+log_info "Closing dm-crypt devices..."
+for dev in /dev/mapper/cryptswap*; do
+    [[ -b "$dev" ]] && cryptsetup close "$dev" 2>/dev/null || true
+done
+
+# 3. Unmount all ZFS datasets (must happen before export/destroy)
+log_info "Unmounting ZFS datasets..."
+zfs umount -a 2>/dev/null || true
+
+# 4. Destroy any existing ZFS pools
+EXISTING_POOLS=$(zpool list -H -o name 2>/dev/null || true)
 if [[ -n "$EXISTING_POOLS" ]]; then
     log_warning "Found existing ZFS pools:"
     zpool list
@@ -177,25 +199,34 @@ if [[ -n "$EXISTING_POOLS" ]]; then
 "The following ZFS pools must be destroyed before installation:
 
 ${POOL_LIST_TEXT}
-Destroy ALL existing ZFS pools?" \
+This will also stop all mdadm RAID arrays.
+
+Destroy everything and continue?" \
 "true"; then
         for pool in $EXISTING_POOLS; do
-            log_info "Destroying pool: $pool"
-            zfs unmount -a          2>/dev/null || true
+            log_info "Exporting pool: $pool"
             zpool export -f "$pool" 2>/dev/null || true
+            log_info "Destroying pool: $pool"
             zpool destroy -f "$pool" 2>/dev/null || true
             log_success "Pool $pool destroyed"
         done
-        log_success "All existing ZFS pools destroyed"
+        log_success "All ZFS pools destroyed"
     else
         log_error "Cannot proceed with existing ZFS pools."
-        log_info  "Destroy them manually: zpool destroy -f <pool_name>"
+        log_info  "Destroy manually: zpool destroy -f <pool_name>"
         exit 1
     fi
 else
     log_success "No existing ZFS pools found"
 fi
-sleep 2
+
+# 5. Stop all mdadm RAID arrays (md0, md1, …)
+log_info "Stopping mdadm arrays..."
+mdadm --stop --scan 2>/dev/null || true
+
+# 6. Let udev process all device removals before we proceed
+udevadm settle --timeout=15
+log_success "Teardown complete"
 
 ################################################################################
 # Helper: enumerate available disks → stdout (one line per item: tag, label)
@@ -454,11 +485,6 @@ LIVE_PKGS="debootstrap gdisk zfsutils-linux mdadm"
 # shellcheck disable=SC2086
 apt-get install -y $LIVE_PKGS
 log_success "Utilities installed"
-
-# Stop any mdadm arrays that may hold partitions on the target disks
-log_info "Stopping active mdadm arrays (if any)..."
-mdadm --stop --scan 2>/dev/null || true
-udevadm settle --timeout=10
 
 ################################################################################
 # Step 2: Partition all selected disks
