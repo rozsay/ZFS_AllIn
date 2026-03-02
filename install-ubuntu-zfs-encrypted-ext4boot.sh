@@ -110,51 +110,83 @@ log_info "Cleaning up ZFS labels..."
 sleep 2
 
 ################################################################################
-# Disk selection
+# Disk selection — whiptail dialog
 ################################################################################
-log_info "Available disks (by-id):"
-echo ""
-ls -lh /dev/disk/by-id/ | grep -v "part" | grep -v "total" \
-    | awk '{print $9, "->", $11}' \
-    | grep -E "ata|nvme|scsi|usb" | sort
-echo ""
-log_info "Available disks (traditional names):"
-lsblk -d -n -p -o NAME,SIZE,MODEL | grep -E "sd|nvme|vd"
-echo ""
-log_warning "Using disk by-id paths is strongly recommended for reliability"
-echo "Example: /dev/disk/by-id/ata-Samsung_SSD_850_PRO_512GB_S1234567"
-echo "Or use traditional names: /dev/sda, /dev/nvme0n1"
-echo ""
-read -rp "Enter the target disk: " DISK_INPUT
 
-# Resolve disk path
-if [[ "$DISK_INPUT" == /dev/disk/by-id/* ]]; then
-    DISK_BY_ID="$DISK_INPUT"
-    DISK=$(readlink -f "$DISK_BY_ID")
-    log_info "Using disk by-id: $DISK_BY_ID"
-    log_info "Resolves to: $DISK"
-elif [[ -b "$DISK_INPUT" ]]; then
-    DISK="$DISK_INPUT"
-    DISK_BY_ID=$(ls -l /dev/disk/by-id/ \
-        | grep "$(basename "$DISK")$" \
-        | grep -v "part" | head -1 \
-        | awk '{print "/dev/disk/by-id/" $9}') || true
-    if [[ -n "$DISK_BY_ID" ]]; then
-        log_info "Found by-id path: $DISK_BY_ID"
-        log_info "Device path: $DISK"
-    else
-        log_warning "Could not find by-id path, using device path: $DISK"
-        DISK_BY_ID="$DISK"
+# Ensure whiptail is available (pre-installed on Ubuntu Live, but just in case)
+if ! command -v whiptail &>/dev/null; then
+    log_info "Installing whiptail..."
+    apt-get install -y whiptail
+fi
+
+# Build whiptail menu items:
+#   TAG  = /dev/disk/by-id/...  (or /dev/sdX if no by-id found)
+#   ITEM = /dev/sda  500G  Samsung SSD 850 PRO
+select_disk_dialog() {
+    local menu_items=()
+    local dev devname size model byid tag label
+
+    while IFS= read -r dev; do
+        devname=$(basename "$dev")
+        size=$(lsblk  -dn -o SIZE  "$dev" 2>/dev/null | xargs || echo "?")
+        model=$(lsblk -dn -o MODEL "$dev" 2>/dev/null | xargs || echo "")
+
+        # Prefer by-id; skip wwn- and dm- aliases, keep ata/nvme/scsi/usb
+        byid=$(ls -l /dev/disk/by-id/ 2>/dev/null \
+            | grep -v "part" \
+            | grep -E "(ata|nvme|scsi|usb)-" \
+            | grep " ${devname}$" \
+            | head -1 \
+            | awk '{print "/dev/disk/by-id/" $9}') || true
+
+        tag="${byid:-$dev}"   # use by-id when available, fall back to /dev/sdX
+
+        # Display label: short device name, size, model
+        if [[ -n "$model" ]]; then
+            label=$(printf "%-12s  %-8s  %s" "/dev/$devname" "$size" "$model")
+        else
+            label=$(printf "%-12s  %-8s" "/dev/$devname" "$size")
+        fi
+
+        menu_items+=("$tag" "$label")
+    done < <(lsblk -dn -p -o NAME \
+        | grep -E "/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|vd[a-z]|hd[a-z])")
+
+    if [[ ${#menu_items[@]} -eq 0 ]]; then
+        log_error "No suitable disks found!"
+        exit 1
     fi
+
+    # whiptail returns the selected TAG to stdout (3>&1 1>&2 2>&3 swaps fd)
+    whiptail \
+        --title  "Disk Selection" \
+        --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
+        --menu \
+"Select the TARGET disk.\n\nWARNING: ALL DATA WILL BE PERMANENTLY DESTROYED!\n\nInternal path used: /dev/disk/by-id/...\nDisplayed path:      /dev/sda with size and model" \
+        22 78 10 \
+        "${menu_items[@]}" \
+        3>&1 1>&2 2>&3
+}
+
+DISK_BY_ID=$(select_disk_dialog) || {
+    log_info "Disk selection cancelled."
+    exit 0
+}
+
+# Resolve the canonical device node from whatever tag was returned
+if [[ "$DISK_BY_ID" == /dev/disk/by-id/* ]]; then
+    DISK=$(readlink -f "$DISK_BY_ID")
 else
-    log_error "Disk '$DISK_INPUT' does not exist or is not a block device!"
-    exit 1
+    DISK="$DISK_BY_ID"   # fallback: already a /dev/sdX path
 fi
 
 if [[ ! -b "$DISK" ]]; then
-    log_error "Disk $DISK does not exist!"
+    log_error "Disk '$DISK' is not a valid block device!"
     exit 1
 fi
+
+log_info "Selected disk:       $DISK"
+log_info "Disk identifier:     $DISK_BY_ID"
 
 echo ""
 log_warning "ALL DATA ON $DISK WILL BE PERMANENTLY DESTROYED!"
