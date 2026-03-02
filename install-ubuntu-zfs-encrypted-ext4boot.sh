@@ -1,5 +1,5 @@
 #!/bin/bash
-# ZFS_AllIn — Ubuntu 24.04 Encrypted ZFS on Root with EXT4 Boot Installer
+# ZFS_AllIn — Ubuntu 24.04 Encrypted ZFS on Root Installer
 # Copyright (C) 2025 rozsay
 #
 # This program is free software: you can redistribute it and/or modify
@@ -16,17 +16,19 @@
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 #
 ################################################################################
-# Ubuntu 24.04 Encrypted ZFS on Root with EXT4 Boot Installation Script
+# Ubuntu 24.04 — Encrypted ZFS on Root with EXT4 /boot
 #
-# Automates Ubuntu 24.04 installation with:
-#   - Native ZFS encryption (AES-256-GCM) on root
-#   - Traditional EXT4 /boot partition (GRUB-compatible)
+# Features:
+#   - Storage topologies: single disk / mirror (2 disks) / RAIDZ1 (3+) / RAIDZ2 (4+)
+#   - /boot on mdadm RAID1 across all member disks (redundant boot)
+#   - EFI installed on every disk (UEFI multi-boot redundancy)
+#   - ZFS native encryption (AES-256-GCM)
+#   - Swap outside ZFS, LUKS-encrypted with random key per boot
+#   - Network: DHCP or static fixed IP
 #   - Full whiptail TUI for all user input
-#   - Disk identification via /dev/disk/by-id/
-#   - Optional ZFS compression (lz4) and swap ZVOL
 #   - Both UEFI and BIOS boot support
 #
-# WARNING: This script will DESTROY all data on the target disk!
+# WARNING: This script will DESTROY all data on the selected disk(s)!
 #
 # Prerequisites:
 #   - Boot from Ubuntu 24.04 Live USB
@@ -41,12 +43,8 @@ set -o pipefail # Catch failures in pipelines
 ################################################################################
 # Color codes and logging
 ################################################################################
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 
 log_info()    { echo -e "${BLUE}[INFO]${NC}    $1"; }
 log_success() { echo -e "${GREEN}[SUCCESS]${NC} $1"; }
@@ -55,17 +53,31 @@ log_error()   { echo -e "${RED}[ERROR]${NC}   $1" >&2; }
 log_step()    { echo -e "${CYAN}[STEP]${NC}    $1"; }
 
 ################################################################################
-# ZFS pool name (global — used by cleanup trap)
+# Global state
 ################################################################################
 POOL_NAME="rpool"
+CLEANUP_DONE=0
+POOL_TOPOLOGY="single"
+
+# Indexed arrays — index i corresponds to DISKS[i]
+DISKS=()       # canonical paths: /dev/sda, /dev/nvme0n1, ...
+DISK_IDS=()    # by-id paths (or same as DISKS if no by-id available)
+EFI_PARTS=()   # EFI partition per disk  (UEFI only)
+BOOT_PARTS=()  # /boot partition per disk
+SWAP_PARTS=()  # swap partition per disk  (empty string when swap disabled)
+ROOT_PARTS=()  # ZFS root partition per disk
+ROOT_IDS=()    # by-id paths for ZFS root partitions
+
+BOOT_DEV=""    # /dev/md0  or  BOOT_PARTS[0]  (single disk)
+BOOT_UUID=""
+EFI_UUID=""    # UUID of the primary (first) EFI partition
 
 ################################################################################
-# Cleanup trap — unmounts everything and exports pool on EXIT
+# Cleanup trap
 ################################################################################
-CLEANUP_DONE=0
 cleanup() {
     [[ "$CLEANUP_DONE" == "1" ]] && return
-    log_warning "Running cleanup (may be due to error)..."
+    log_warning "Running cleanup..."
     umount -R /mnt/dev  2>/dev/null || true
     umount -R /mnt/proc 2>/dev/null || true
     umount -R /mnt/sys  2>/dev/null || true
@@ -73,6 +85,7 @@ cleanup() {
     umount /mnt/boot     2>/dev/null || true
     zfs umount -a        2>/dev/null || true
     zpool export "$POOL_NAME" 2>/dev/null || true
+    mdadm --stop /dev/md0 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -80,7 +93,7 @@ trap cleanup EXIT
 # Root check
 ################################################################################
 if [[ $EUID -ne 0 ]]; then
-    log_error "This script must be run as root (use: sudo bash $0)"
+    log_error "This script must be run as root: sudo bash $0"
     exit 1
 fi
 
@@ -91,8 +104,8 @@ clear
 echo ""
 echo "==========================================================================="
 echo "  Ubuntu 24.04 — Encrypted ZFS on Root with EXT4 /boot"
-echo "  ZFS Cleanup · IPv6 Disable · Initial Snapshots"
-echo "  Disk identified by /dev/disk/by-id/ for reliability"
+echo "  Single | Mirror | RAIDZ1 | RAIDZ2  ·  LUKS Swap  ·  Static/DHCP IP"
+echo "  /boot and EFI redundancy across all pool member disks"
 echo "==========================================================================="
 echo ""
 
@@ -109,26 +122,26 @@ fi
 ################################################################################
 
 # ask_input <title> <prompt> [default]
-# Shows an inputbox; prints the entered value to stdout. Exits on Cancel.
+# Displays an inputbox. Prints the entered value to stdout. Exits on Cancel.
 ask_input() {
     local title="$1" prompt="$2" default="${3:-}"
     local result
     result=$(whiptail \
         --title     "$title" \
         --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
-        --inputbox  "$prompt" 10 60 "$default" \
+        --inputbox  "$prompt" 10 65 "$default" \
         3>&1 1>&2 2>&3) || { log_info "Cancelled."; exit 0; }
     echo "$result"
 }
 
 # ask_password <title> <prompt>
-# Shows a passwordbox; prints the entered value to stdout. Exits on Cancel.
+# Displays a passwordbox. Prints the entered value to stdout. Exits on Cancel.
 ask_password() {
     local title="$1" prompt="$2"
     whiptail \
         --title        "$title" \
         --backtitle    "Ubuntu 24.04 Encrypted ZFS Installer" \
-        --passwordbox  "$prompt" 10 60 \
+        --passwordbox  "$prompt" 10 65 \
         3>&1 1>&2 2>&3 || { log_info "Cancelled."; exit 0; }
 }
 
@@ -146,7 +159,7 @@ ask_yesno() {
 }
 
 ################################################################################
-# ZFS pool cleanup (if existing pools are found)
+# ZFS pool cleanup
 ################################################################################
 log_step "Checking for existing ZFS pools..."
 EXISTING_POOLS=$(zpool list -H -o name 2>/dev/null || true)
@@ -155,18 +168,20 @@ if [[ -n "$EXISTING_POOLS" ]]; then
     log_warning "Found existing ZFS pools:"
     zpool list
     echo ""
+    POOL_LIST_TEXT=""
+    while IFS= read -r p; do
+        POOL_LIST_TEXT+="  $p"$'\n'
+    done <<< "$EXISTING_POOLS"
 
     if ask_yesno "Existing ZFS Pools" \
-"The following ZFS pools already exist and must be destroyed before installation:
+"The following ZFS pools must be destroyed before installation:
 
-$(echo "$EXISTING_POOLS" | sed 's/^/  /')
-
-Do you want to DESTROY ALL existing ZFS pools?" \
+${POOL_LIST_TEXT}
+Destroy ALL existing ZFS pools?" \
 "true"; then
-        log_info "Destroying existing ZFS pools..."
         for pool in $EXISTING_POOLS; do
-            log_info "Unmounting and destroying pool: $pool"
-            zfs unmount -a      2>/dev/null || true
+            log_info "Destroying pool: $pool"
+            zfs unmount -a          2>/dev/null || true
             zpool export -f "$pool" 2>/dev/null || true
             zpool destroy -f "$pool" 2>/dev/null || true
             log_success "Pool $pool destroyed"
@@ -180,118 +195,180 @@ Do you want to DESTROY ALL existing ZFS pools?" \
 else
     log_success "No existing ZFS pools found"
 fi
-
-# Allow udev to settle after pool operations
 sleep 2
 
 ################################################################################
-# Disk selection — whiptail menu
+# Helper: enumerate available disks → stdout (one line per item: tag, label)
 ################################################################################
-log_step "Discovering disks for selection..."
-
-select_disk_dialog() {
-    local menu_items=()
+list_disks() {
     local dev devname size model byid tag label
-
     while IFS= read -r dev; do
         devname=$(basename "$dev")
         size=$(lsblk  -dn -o SIZE  "$dev" 2>/dev/null | xargs || echo "?")
         model=$(lsblk -dn -o MODEL "$dev" 2>/dev/null | xargs || echo "")
-
-        # Prefer by-id; keep ata/nvme/scsi/usb, skip wwn/dm and partition entries
         byid=$(ls -l /dev/disk/by-id/ 2>/dev/null \
             | grep -v "part" \
             | grep -E "(ata|nvme|scsi|usb)-" \
             | grep " ${devname}$" \
             | head -1 \
             | awk '{print "/dev/disk/by-id/" $9}') || true
-
         tag="${byid:-$dev}"
-
         if [[ -n "$model" ]]; then
-            label=$(printf "%-12s  %-8s  %s" "/dev/$devname" "$size" "$model")
+            label=$(printf "%-12s %-8s %s" "/dev/$devname" "$size" "$model")
         else
-            label=$(printf "%-12s  %-8s" "/dev/$devname" "$size")
+            label=$(printf "%-12s %-8s" "/dev/$devname" "$size")
         fi
-
-        menu_items+=("$tag" "$label")
+        printf '%s\n%s\n' "$tag" "$label"
     done < <(lsblk -dn -p -o NAME \
         | grep -E "/dev/(sd[a-z]|nvme[0-9]+n[0-9]+|vd[a-z]|hd[a-z])")
+}
 
-    if [[ ${#menu_items[@]} -eq 0 ]]; then
-        log_error "No suitable disks found!"
-        exit 1
-    fi
+################################################################################
+# Storage topology selection
+################################################################################
+POOL_TOPOLOGY=$(whiptail \
+    --title     "Storage Topology" \
+    --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
+    --menu \
+"Select the ZFS pool topology:
 
-    whiptail \
+  Mirror needs exactly 2 disks.
+  RAIDZ1 needs at least 3 disks.
+  RAIDZ2 needs at least 4 disks." \
+    18 72 4 \
+    "single" "Single disk     — no redundancy" \
+    "mirror" "Mirror (RAID1)  — 2 disks, tolerates 1 disk failure" \
+    "raidz1" "RAIDZ1          — 3+ disks, tolerates 1 disk failure" \
+    "raidz2" "RAIDZ2          — 4+ disks, tolerates 2 disk failures" \
+    3>&1 1>&2 2>&3) || { log_info "Cancelled."; exit 0; }
+
+case "$POOL_TOPOLOGY" in
+    single) MIN_DISKS=1; EXACT_DISKS=1 ;;
+    mirror) MIN_DISKS=2; EXACT_DISKS=2 ;;
+    raidz1) MIN_DISKS=3; EXACT_DISKS=0 ;;  # 0 = no upper limit
+    raidz2) MIN_DISKS=4; EXACT_DISKS=0 ;;
+esac
+
+################################################################################
+# Disk selection
+################################################################################
+log_step "Discovering available disks..."
+mapfile -t DISK_ITEMS < <(list_disks)
+
+if [[ ${#DISK_ITEMS[@]} -eq 0 ]]; then
+    log_error "No suitable disks found!"
+    exit 1
+fi
+
+if [[ "$POOL_TOPOLOGY" == "single" ]]; then
+    # Single-select menu
+    SELECTED=$(whiptail \
         --title     "Disk Selection" \
         --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
         --menu \
 "Select the TARGET disk.
 
-WARNING: ALL DATA WILL BE PERMANENTLY DESTROYED!
-
-Internal path: /dev/disk/by-id/...
-Display:       /dev/sda  SIZE  MODEL" \
+WARNING: ALL DATA WILL BE PERMANENTLY DESTROYED!" \
         22 78 10 \
-        "${menu_items[@]}" \
-        3>&1 1>&2 2>&3
-}
-
-DISK_BY_ID=$(select_disk_dialog) || {
-    log_info "Disk selection cancelled."
-    exit 0
-}
-
-# Resolve canonical device node from whatever tag was returned
-if [[ "$DISK_BY_ID" == /dev/disk/by-id/* ]]; then
-    DISK=$(readlink -f "$DISK_BY_ID")
+        "${DISK_ITEMS[@]}" \
+        3>&1 1>&2 2>&3) || { log_info "Cancelled."; exit 0; }
+    DISK_IDS=("$SELECTED")
 else
-    DISK="$DISK_BY_ID"
+    # Multi-select checklist
+    CHECKLIST_ITEMS=()
+    for (( i=0; i<${#DISK_ITEMS[@]}; i+=2 )); do
+        CHECKLIST_ITEMS+=("${DISK_ITEMS[$i]}" "${DISK_ITEMS[$i+1]}" "OFF")
+    done
+
+    while true; do
+        SELECTED=$(whiptail \
+            --title     "Disk Selection ($POOL_TOPOLOGY)" \
+            --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
+            --checklist \
+"Select disks for the $POOL_TOPOLOGY pool.
+Required: at least $MIN_DISKS disk(s).
+Press SPACE to toggle, ENTER to confirm.
+
+WARNING: ALL DATA WILL BE PERMANENTLY DESTROYED!" \
+            24 78 12 \
+            "${CHECKLIST_ITEMS[@]}" \
+            3>&1 1>&2 2>&3) || { log_info "Cancelled."; exit 0; }
+
+        mapfile -t DISK_IDS_TMP < \
+            <(echo "$SELECTED" | tr ' ' '\n' | tr -d '"' | grep -v '^$')
+        COUNT="${#DISK_IDS_TMP[@]}"
+
+        LIMIT_OK=1
+        [[ "$EXACT_DISKS" -gt 0 && "$COUNT" -ne "$EXACT_DISKS" ]] && LIMIT_OK=0
+        [[ "$COUNT" -lt "$MIN_DISKS" ]] && LIMIT_OK=0
+
+        if [[ "$LIMIT_OK" -eq 1 ]]; then
+            DISK_IDS=("${DISK_IDS_TMP[@]}")
+            break
+        fi
+
+        MSG="Please select exactly $MIN_DISKS disks for $POOL_TOPOLOGY."
+        [[ "$EXACT_DISKS" -eq 0 ]] && \
+            MSG="Please select at least $MIN_DISKS disks for $POOL_TOPOLOGY."
+        whiptail --title "Wrong number of disks selected" \
+            --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
+            --msgbox "$MSG\nYou selected: $COUNT" 8 60
+    done
 fi
 
-if [[ ! -b "$DISK" ]]; then
-    log_error "Disk '$DISK' is not a valid block device!"
-    exit 1
-fi
+# Resolve canonical /dev/sdX paths from by-id (or pass-through)
+for id in "${DISK_IDS[@]}"; do
+    if [[ "$id" == /dev/disk/by-id/* ]]; then
+        DISKS+=("$(readlink -f "$id")")
+    else
+        DISKS+=("$id")
+    fi
+done
 
-log_info "Selected disk:   $DISK"
-log_info "Disk identifier: $DISK_BY_ID"
+for d in "${DISKS[@]}"; do
+    [[ -b "$d" ]] || { log_error "Not a valid block device: $d"; exit 1; }
+done
+
+################################################################################
+# Confirmation
+################################################################################
+DISK_LIST_TEXT=""
+for i in "${!DISKS[@]}"; do
+    DISK_LIST_TEXT+="  ${DISKS[$i]}"$'\n'
+    DISK_LIST_TEXT+="  (${DISK_IDS[$i]})"$'\n'
+    DISK_LIST_TEXT+=$'\n'
+done
 
 if ! ask_yesno "CONFIRM DESTRUCTIVE OPERATION" \
-"ALL DATA ON THE FOLLOWING DISK WILL BE PERMANENTLY DESTROYED:
+"ALL DATA ON THE FOLLOWING DISK(S) WILL BE PERMANENTLY DESTROYED:
 
-  $DISK
-  ($DISK_BY_ID)
+${DISK_LIST_TEXT}Topology: $POOL_TOPOLOGY  (${#DISKS[@]} disk(s))
 
 This operation CANNOT be undone!
 
-Are you absolutely sure you want to continue?" \
+Are you absolutely sure?" \
 "true"; then
     log_info "Installation cancelled."
     exit 0
 fi
 
 ################################################################################
-# User configuration prompts
+# User configuration
 ################################################################################
-
 HOSTNAME=$(ask_input "System Configuration" \
-    "Enter hostname for the new system:" "ubuntu-zfs")
+    "Hostname for the new system:" "ubuntu-zfs")
 [[ -z "$HOSTNAME" ]] && { log_error "Hostname cannot be empty!"; exit 1; }
 
 USERNAME=$(ask_input "System Configuration" \
-    "Enter username for the new user:" "")
+    "Username for the new user:" "")
 [[ -z "$USERNAME" ]] && { log_error "Username cannot be empty!"; exit 1; }
 
 while true; do
     USER_PASSWORD=$(ask_password "User Password" \
-        "Enter password for '$USERNAME':")
+        "Password for '$USERNAME':")
     USER_PASSWORD_CONFIRM=$(ask_password "User Password" \
         "Confirm password for '$USERNAME':")
-    if [[ "$USER_PASSWORD" == "$USER_PASSWORD_CONFIRM" ]]; then
-        break
-    fi
+    [[ "$USER_PASSWORD" == "$USER_PASSWORD_CONFIRM" ]] && break
     whiptail --title "Error" \
         --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
         --msgbox "Passwords do not match. Please try again." 8 50
@@ -299,21 +376,43 @@ done
 
 while true; do
     ZFS_PASSPHRASE=$(ask_password "ZFS Encryption" \
-        "Enter ZFS encryption passphrase:")
+        "ZFS encryption passphrase:")
     ZFS_PASSPHRASE_CONFIRM=$(ask_password "ZFS Encryption" \
         "Confirm ZFS encryption passphrase:")
-    if [[ "$ZFS_PASSPHRASE" == "$ZFS_PASSPHRASE_CONFIRM" ]]; then
-        break
-    fi
+    [[ "$ZFS_PASSPHRASE" == "$ZFS_PASSPHRASE_CONFIRM" ]] && break
     whiptail --title "Error" \
         --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
         --msgbox "Passphrases do not match. Please try again." 8 50
 done
 
 ################################################################################
+# Network configuration
+################################################################################
+NET_MODE="dhcp"
+NET_IP=""
+NET_GW=""
+NET_DNS=""
+
+if ! ask_yesno "Network Configuration" \
+"Use DHCP for network configuration?
+
+Select 'No' to configure a static fixed IP address."; then
+    NET_MODE="static"
+    NET_IP=$(ask_input "Static IP" \
+        "IP address with prefix length:" "192.168.1.100/24")
+    [[ -z "$NET_IP" ]] && { log_error "IP address cannot be empty!"; exit 1; }
+
+    NET_GW=$(ask_input "Static IP" \
+        "Default gateway:" "192.168.1.1")
+    [[ -z "$NET_GW" ]] && { log_error "Gateway cannot be empty!"; exit 1; }
+
+    NET_DNS=$(ask_input "Static IP" \
+        "DNS servers (comma-separated):" "8.8.8.8,8.8.4.4")
+fi
+
+################################################################################
 # Optional features
 ################################################################################
-
 if ask_yesno "ZFS Options" \
 "Enable ZFS compression (lz4)?
 
@@ -323,14 +422,14 @@ else
     COMPRESSION_OPT="off"
 fi
 
-if ask_yesno "ZFS Options" "Create a ZFS swap volume (4 GB)?"; then
-    CREATE_SWAP="yes"
-else
-    CREATE_SWAP="no"
-fi
+SWAP_SIZE=$(ask_input "Swap Configuration" \
+    "Encrypted swap partition size per disk.
+Enter 0 to disable swap entirely.
+Examples: 4G, 8G, 16G" "4G")
+SWAP_SIZE="${SWAP_SIZE:-4G}"
 
 TIMEZONE=$(ask_input "System Configuration" \
-    "Enter timezone (e.g. Europe/Budapest, America/New_York, UTC):" "UTC")
+    "Timezone (e.g. Europe/Budapest, America/New_York, UTC):" "UTC")
 TIMEZONE="${TIMEZONE:-UTC}"
 
 ################################################################################
@@ -338,94 +437,164 @@ TIMEZONE="${TIMEZONE:-UTC}"
 ################################################################################
 if [[ -d /sys/firmware/efi ]]; then
     BOOT_MODE="UEFI"
-    log_info "Detected boot mode: UEFI"
+    log_info "Boot mode: UEFI"
 else
     BOOT_MODE="BIOS"
-    log_info "Detected boot mode: BIOS (Legacy)"
+    log_info "Boot mode: BIOS (Legacy)"
 fi
 
 ################################################################################
-# Step 1: Install ZFS utilities
+# Step 1: Install required utilities on the live system
 ################################################################################
-log_step "Step 1: Installing ZFS utilities..."
+log_step "Step 1: Installing required utilities..."
 apt-get update -qq
-apt-get install -y debootstrap gdisk zfsutils-linux
-log_success "ZFS utilities installed"
+
+LIVE_PKGS="debootstrap gdisk zfsutils-linux mdadm"
+[[ "$SWAP_SIZE" != "0" ]] && LIVE_PKGS+=" cryptsetup"
+# shellcheck disable=SC2086
+apt-get install -y $LIVE_PKGS
+log_success "Utilities installed"
 
 ################################################################################
-# Step 2: Partition the disk
+# Step 2: Partition all selected disks
+#
+# Partition layout (UEFI, with swap):
+#   Part 1:  512 MB   EFI System Partition (FAT32)      type EF00
+#   Part 2:  2 GB     /boot ext4 / mdadm RAID1 member   type FD00
+#   Part 3:  SWAP_SIZE  swap (LUKS encrypted)            type 8200
+#   Part 4:  rest     ZFS root pool member               type BF00
+#
+# Partition layout (BIOS, with swap):
+#   Part 1:  1 MB     BIOS boot                          type EF02
+#   Part 2:  2 GB     /boot ext4 / mdadm RAID1 member   type FD00
+#   Part 3:  SWAP_SIZE  swap (LUKS encrypted)            type 8200
+#   Part 4:  rest     ZFS root pool member               type BF00
+#
+# Without swap: parts 3 & 4 collapse to a single part 3 for ZFS.
 ################################################################################
-log_step "Step 2: Partitioning disk $DISK..."
+log_step "Step 2: Partitioning ${#DISKS[@]} disk(s)..."
 
-# nvme and mmcblk devices use a "p" suffix before the partition number
-if [[ "$DISK" =~ nvme|mmcblk ]]; then
-    PART_PREFIX="${DISK}p"
-else
-    PART_PREFIX="${DISK}"
-fi
+for i in "${!DISKS[@]}"; do
+    DISK="${DISKS[$i]}"
+    log_info "Partitioning $DISK..."
 
-sgdisk --zap-all "$DISK"
-
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    sgdisk -n1:1M:+512M  -t1:EF00 "$DISK"   # EFI System Partition (512 MB FAT32)
-    sgdisk -n2:0:+2G     -t2:8300 "$DISK"   # /boot (2 GB ext4)
-    sgdisk -n3:0:0       -t3:BF00 "$DISK"   # ZFS root pool (remaining space)
-    EFI_PART="${PART_PREFIX}1"
-    BOOT_PART="${PART_PREFIX}2"
-    ROOT_PART="${PART_PREFIX}3"
-else
-    sgdisk -a1 -n1:24K:+1000K -t1:EF02 "$DISK"  # BIOS boot partition (1 MB)
-    sgdisk     -n2:0:+2G      -t2:8300 "$DISK"  # /boot (2 GB ext4)
-    sgdisk     -n3:0:0        -t3:BF00 "$DISK"  # ZFS root pool (remaining space)
-    BIOS_PART="${PART_PREFIX}1"
-    BOOT_PART="${PART_PREFIX}2"
-    ROOT_PART="${PART_PREFIX}3"
-fi
-
-sgdisk -p "$DISK"
-sleep 2
-partprobe "$DISK"
-sleep 2
-
-# Resolve partition by-id paths (fall back to /dev/sdXN if symlinks not ready)
-log_info "Discovering partition identifiers..."
-if [[ "$DISK_BY_ID" == /dev/disk/by-id/* ]]; then
-    BOOT_PART_BY_ID="${DISK_BY_ID}-part2"
-    ROOT_PART_BY_ID="${DISK_BY_ID}-part3"
-    [[ "$BOOT_MODE" == "UEFI" ]] && EFI_PART_BY_ID="${DISK_BY_ID}-part1"
-
-    if [[ ! -b "$ROOT_PART_BY_ID" ]]; then
-        log_warning "by-id path not found for root partition, falling back to $ROOT_PART"
-        ROOT_PART_BY_ID="$ROOT_PART"
+    # Determine partition naming (nvme/mmcblk use "p" suffix)
+    if [[ "$DISK" =~ nvme|mmcblk ]]; then
+        PREF="${DISK}p"
+    else
+        PREF="${DISK}"
     fi
-    if [[ ! -b "$BOOT_PART_BY_ID" ]]; then
-        log_warning "by-id path not found for boot partition, falling back to $BOOT_PART"
-        BOOT_PART_BY_ID="$BOOT_PART"
+
+    sgdisk --zap-all "$DISK"
+
+    if [[ "$BOOT_MODE" == "UEFI" ]]; then
+        sgdisk -n1:1M:+512M   -t1:EF00 "$DISK"   # EFI System Partition
+        sgdisk -n2:0:+2G      -t2:FD00 "$DISK"   # /boot (mdadm RAID1 member)
+        if [[ "$SWAP_SIZE" != "0" ]]; then
+            sgdisk -n3:0:+"${SWAP_SIZE}" -t3:8200 "$DISK"   # encrypted swap
+            sgdisk -n4:0:0              -t4:BF00 "$DISK"   # ZFS root
+            EFI_PARTS+=("${PREF}1")
+            BOOT_PARTS+=("${PREF}2")
+            SWAP_PARTS+=("${PREF}3")
+            ROOT_PARTS+=("${PREF}4")
+        else
+            sgdisk -n3:0:0 -t3:BF00 "$DISK"   # ZFS root
+            EFI_PARTS+=("${PREF}1")
+            BOOT_PARTS+=("${PREF}2")
+            SWAP_PARTS+=("")
+            ROOT_PARTS+=("${PREF}3")
+        fi
+    else
+        sgdisk -a1 -n1:24K:+1000K -t1:EF02 "$DISK"  # BIOS boot
+        sgdisk     -n2:0:+2G      -t2:FD00 "$DISK"  # /boot (mdadm RAID1 member)
+        if [[ "$SWAP_SIZE" != "0" ]]; then
+            sgdisk -n3:0:+"${SWAP_SIZE}" -t3:8200 "$DISK"   # encrypted swap
+            sgdisk -n4:0:0              -t4:BF00 "$DISK"   # ZFS root
+            BOOT_PARTS+=("${PREF}2")
+            SWAP_PARTS+=("${PREF}3")
+            ROOT_PARTS+=("${PREF}4")
+        else
+            sgdisk -n3:0:0 -t3:BF00 "$DISK"   # ZFS root
+            BOOT_PARTS+=("${PREF}2")
+            SWAP_PARTS+=("")
+            ROOT_PARTS+=("${PREF}3")
+        fi
     fi
+
+    log_success "Disk $DISK partitioned"
+done
+
+# Show partition table of the first disk as reference
+sgdisk -p "${DISKS[0]}"
+sleep 2
+for DISK in "${DISKS[@]}"; do
+    partprobe "$DISK"
+done
+sleep 3
+
+# Resolve by-id paths for ZFS root partitions
+# ZFS root is part4 when swap is present, part3 when swap is disabled.
+[[ "$SWAP_SIZE" != "0" ]] && ZFS_PART_NUM=4 || ZFS_PART_NUM=3
+# BIOS mode has no EFI part so part numbers are the same
+# (bios_boot=1, boot=2, [swap=3,] zfs=3or4)
+
+for i in "${!DISKS[@]}"; do
+    DISK_ID="${DISK_IDS[$i]}"
+    if [[ "$DISK_ID" == /dev/disk/by-id/* ]]; then
+        CANDIDATE="${DISK_ID}-part${ZFS_PART_NUM}"
+        if [[ -b "$CANDIDATE" ]]; then
+            ROOT_IDS+=("$CANDIDATE")
+        else
+            log_warning "by-id not found for ZFS partition on disk $((i+1)), using ${ROOT_PARTS[$i]}"
+            ROOT_IDS+=("${ROOT_PARTS[$i]}")
+        fi
+    else
+        ROOT_IDS+=("${ROOT_PARTS[$i]}")
+    fi
+done
+
+log_success "All disks partitioned"
+
+################################################################################
+# Step 3: Create /boot filesystem
+#
+# Single disk:  mkfs.ext4 directly on the boot partition
+# Multi-disk:   mdadm RAID1 across all boot partitions, then mkfs.ext4 on md0
+#               --metadata=1.0 stores the superblock at the end of the
+#               partition so GRUB can read ext4 from the start.
+################################################################################
+log_step "Step 3: Setting up /boot..."
+
+NDISKS="${#DISKS[@]}"
+if [[ "$NDISKS" -eq 1 ]]; then
+    BOOT_DEV="${BOOT_PARTS[0]}"
+    mkfs.ext4 -F -L boot "$BOOT_DEV"
 else
-    ROOT_PART_BY_ID="$ROOT_PART"
-    BOOT_PART_BY_ID="$BOOT_PART"
-    [[ "$BOOT_MODE" == "UEFI" ]] && EFI_PART_BY_ID="${EFI_PART}"
+    mdadm --create /dev/md0 \
+        --level=1 \
+        --raid-devices="$NDISKS" \
+        --metadata=1.0 \
+        --quiet \
+        "${BOOT_PARTS[@]}"
+    BOOT_DEV="/dev/md0"
+    mkfs.ext4 -F -L boot "$BOOT_DEV"
 fi
 
-log_info "Boot partition: $BOOT_PART_BY_ID"
-log_info "Root partition: $ROOT_PART_BY_ID"
-log_success "Disk partitioned"
-
-################################################################################
-# Step 3: Format /boot partition (ext4)
-################################################################################
-log_step "Step 3: Formatting /boot partition as ext4..."
-mkfs.ext4 -F -L boot "$BOOT_PART"
-BOOT_UUID=$(blkid -s UUID -o value "$BOOT_PART")
-log_info "Boot partition UUID: $BOOT_UUID"
-log_success "/boot partition formatted"
+BOOT_UUID=$(blkid -s UUID -o value "$BOOT_DEV")
+log_info "Boot device: $BOOT_DEV  (UUID: $BOOT_UUID)"
+log_success "/boot ready"
 
 ################################################################################
 # Step 4: Create encrypted ZFS root pool
 ################################################################################
-log_step "Step 4: Creating encrypted ZFS root pool ($POOL_NAME)..."
-log_info "Device: $ROOT_PART_BY_ID"
+log_step "Step 4: Creating encrypted ZFS pool ($POOL_NAME)..."
+
+case "$POOL_TOPOLOGY" in
+    single) ZPOOL_VDEV_ARGS=("${ROOT_IDS[0]}") ;;
+    mirror) ZPOOL_VDEV_ARGS=(mirror "${ROOT_IDS[@]}") ;;
+    raidz1) ZPOOL_VDEV_ARGS=(raidz  "${ROOT_IDS[@]}") ;;
+    raidz2) ZPOOL_VDEV_ARGS=(raidz2 "${ROOT_IDS[@]}") ;;
+esac
 
 echo -n "$ZFS_PASSPHRASE" | zpool create \
     -o ashift=12 \
@@ -442,99 +611,90 @@ echo -n "$ZFS_PASSPHRASE" | zpool create \
     -O xattr=sa \
     -O mountpoint=/ \
     -R /mnt \
-    "$POOL_NAME" "$ROOT_PART_BY_ID" -f
+    "$POOL_NAME" "${ZPOOL_VDEV_ARGS[@]}" -f
 
 zpool list "$POOL_NAME" >/dev/null 2>&1 || {
     log_error "Failed to create ZFS pool $POOL_NAME"
     exit 1
 }
-log_success "Encrypted root pool created"
+log_success "ZFS pool created ($POOL_TOPOLOGY)"
 
 ################################################################################
 # Step 5: Create ZFS datasets
 ################################################################################
 log_step "Step 5: Creating ZFS datasets..."
 
-zfs create -o canmount=off    -o mountpoint=none             "$POOL_NAME/ROOT"
-zfs create -o canmount=noauto -o mountpoint=/                "$POOL_NAME/ROOT/ubuntu"
+zfs create -o canmount=off    -o mountpoint=none  "$POOL_NAME/ROOT"
+zfs create -o canmount=noauto -o mountpoint=/     "$POOL_NAME/ROOT/ubuntu"
 zfs mount "$POOL_NAME/ROOT/ubuntu"
 
-zfs create -o mountpoint=/home                               "$POOL_NAME/home"
-zfs create -o mountpoint=/root                               "$POOL_NAME/home/root"
+zfs create -o mountpoint=/home                    "$POOL_NAME/home"
+zfs create -o mountpoint=/root                    "$POOL_NAME/home/root"
 chmod 700 /mnt/root
 
-zfs create -o canmount=off -o mountpoint=/var                "$POOL_NAME/var"
-zfs create -o mountpoint=/var/log                            "$POOL_NAME/var/log"
-zfs create -o mountpoint=/var/spool                          "$POOL_NAME/var/spool"
-zfs create -o mountpoint=/var/tmp                            "$POOL_NAME/var/tmp"
+zfs create -o canmount=off -o mountpoint=/var     "$POOL_NAME/var"
+zfs create -o mountpoint=/var/log                 "$POOL_NAME/var/log"
+zfs create -o mountpoint=/var/spool               "$POOL_NAME/var/spool"
+zfs create -o mountpoint=/var/tmp                 "$POOL_NAME/var/tmp"
 zfs create -o com.sun:auto-snapshot=false \
-           -o mountpoint=/var/cache                          "$POOL_NAME/var/cache"
-zfs create -o mountpoint=/var/lib                            "$POOL_NAME/var/lib"
+           -o mountpoint=/var/cache               "$POOL_NAME/var/cache"
+zfs create -o mountpoint=/var/lib                 "$POOL_NAME/var/lib"
 zfs create -o com.sun:auto-snapshot=false \
-           -o mountpoint=/var/lib/docker                     "$POOL_NAME/var/lib/docker"
+           -o mountpoint=/var/lib/docker          "$POOL_NAME/var/lib/docker"
 zfs create -o com.sun:auto-snapshot=false \
-           -o mountpoint=/var/lib/nfs                        "$POOL_NAME/var/lib/nfs"
+           -o mountpoint=/var/lib/nfs             "$POOL_NAME/var/lib/nfs"
 zfs create -o com.sun:auto-snapshot=false \
-           -o mountpoint=/tmp                                "$POOL_NAME/tmp"
+           -o mountpoint=/tmp                     "$POOL_NAME/tmp"
 chmod 1777 /mnt/var/tmp /mnt/tmp
-
-# Optional swap ZVOL
-if [[ "$CREATE_SWAP" == "yes" ]]; then
-    log_info "Creating 4 GB swap ZVOL..."
-    zfs create \
-        -V 4G \
-        -b "$(getconf PAGESIZE)" \
-        -o compression=zle \
-        -o logbias=throughput \
-        -o sync=always \
-        -o primarycache=metadata \
-        -o secondarycache=none \
-        "$POOL_NAME/swap"
-    mkswap -f "/dev/zvol/$POOL_NAME/swap"
-    log_success "Swap ZVOL created"
-fi
 
 log_success "ZFS datasets created"
 
 ################################################################################
-# Step 6: Mount /boot partition
+# Step 6: Mount /boot
 ################################################################################
-log_step "Step 6: Mounting /boot partition..."
+log_step "Step 6: Mounting /boot..."
 mkdir -p /mnt/boot
-mount "$BOOT_PART" /mnt/boot
+mount "$BOOT_DEV" /mnt/boot
 log_success "/boot mounted"
 
 ################################################################################
-# Step 7: Format and mount EFI partition (UEFI only)
+# Step 7: EFI partitions (UEFI only)
+#
+# Format all EFI partitions as FAT32.  Mount the first one now so debootstrap
+# and GRUB installation can proceed.  The remaining EFI partitions will have
+# GRUB installed in Step 12 (mount each in turn).
 ################################################################################
+EFI_UUID=""
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    log_step "Step 7: Formatting and mounting EFI partition..."
-    mkfs.vfat -F32 "$EFI_PART"
-    EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
-    log_info "EFI partition UUID: $EFI_UUID"
+    log_step "Step 7: Formatting EFI partition(s)..."
+    for (( i=0; i<${#EFI_PARTS[@]}; i++ )); do
+        mkfs.vfat -F32 "${EFI_PARTS[$i]}"
+        log_info "Formatted EFI: ${EFI_PARTS[$i]}"
+    done
+    EFI_UUID=$(blkid -s UUID -o value "${EFI_PARTS[0]}")
     mkdir -p /mnt/boot/efi
-    mount "$EFI_PART" /mnt/boot/efi
-    log_success "EFI partition formatted and mounted"
+    mount "${EFI_PARTS[0]}" /mnt/boot/efi
+    log_info "Primary EFI UUID: $EFI_UUID"
+    log_success "EFI partitions ready"
 else
-    log_step "Step 7: BIOS mode — EFI partition not needed, skipping"
-    EFI_UUID=""
-    EFI_PART_BY_ID=""
+    log_step "Step 7: BIOS mode — EFI not applicable, skipping"
 fi
 
 ################################################################################
-# Step 8: Install Ubuntu base system via debootstrap
+# Step 8: Install Ubuntu base system
 ################################################################################
-log_step "Step 8: Installing Ubuntu base system (this may take several minutes)..."
+log_step "Step 8: Installing Ubuntu base system via debootstrap..."
 debootstrap \
     --mirror=http://archive.ubuntu.com/ubuntu \
     noble /mnt
 log_success "Base system installed"
 
 ################################################################################
-# Step 9: Pre-chroot system configuration
+# Step 9: Pre-chroot configuration
 ################################################################################
 log_step "Step 9: Configuring system (pre-chroot)..."
 
+# Hostname
 echo "$HOSTNAME" > /mnt/etc/hostname
 
 cat > /mnt/etc/hosts <<EOF
@@ -545,8 +705,10 @@ ff02::1     ip6-allnodes
 ff02::2     ip6-allrouters
 EOF
 
+# Netplan — DHCP or static fixed IP
 mkdir -p /mnt/etc/netplan
-cat > /mnt/etc/netplan/01-netcfg.yaml <<EOF
+if [[ "$NET_MODE" == "dhcp" ]]; then
+    cat > /mnt/etc/netplan/01-netcfg.yaml <<EOF
 network:
   version: 2
   renderer: networkd
@@ -556,8 +718,30 @@ network:
         name: en*
       dhcp4: true
 EOF
+else
+    # Build YAML DNS list from comma-separated input
+    DNS_YAML=$(echo "$NET_DNS" | tr ',' '\n' | \
+        awk '{printf "        - %s\n", $1}')
+    cat > /mnt/etc/netplan/01-netcfg.yaml <<EOF
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    all-en:
+      match:
+        name: en*
+      addresses:
+        - $NET_IP
+      routes:
+        - to: default
+          via: $NET_GW
+      nameservers:
+        addresses:
+${DNS_YAML}
+EOF
+fi
 
-# Write APT sources — do NOT copy from live USB
+# APT sources (never copy from live USB)
 cat > /mnt/etc/apt/sources.list <<EOF
 deb http://archive.ubuntu.com/ubuntu noble main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu noble-updates main restricted universe multiverse
@@ -571,37 +755,62 @@ net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
 
-# /etc/fstab using UUIDs
+# /etc/fstab
 cat > /mnt/etc/fstab <<EOF
 # <file system>                         <mount>     <type>  <options>     <dump> <pass>
 UUID=$BOOT_UUID                         /boot       ext4    defaults      0      2
 EOF
-
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     cat >> /mnt/etc/fstab <<EOF
 UUID=$EFI_UUID                          /boot/efi   vfat    umask=0077    0      1
 EOF
 fi
 
-if [[ "$CREATE_SWAP" == "yes" ]]; then
-    cat >> /mnt/etc/fstab <<EOF
-/dev/zvol/$POOL_NAME/swap               none        swap    discard       0      0
-EOF
+# Encrypted swap — one entry per disk in /etc/crypttab + /etc/fstab
+if [[ "$SWAP_SIZE" != "0" ]]; then
+    : > /mnt/etc/crypttab
+    for i in "${!SWAP_PARTS[@]}"; do
+        [[ -z "${SWAP_PARTS[$i]}" ]] && continue
+        CRYPTNAME="cryptswap$((i+1))"
+
+        # Prefer by-id path in crypttab for stability
+        DISK_ID="${DISK_IDS[$i]}"
+        if [[ "$DISK_ID" == /dev/disk/by-id/* ]]; then
+            SWAP_DEV_ID="${DISK_ID}-part3"
+            [[ -b "$SWAP_DEV_ID" ]] || SWAP_DEV_ID="${SWAP_PARTS[$i]}"
+        else
+            SWAP_DEV_ID="${SWAP_PARTS[$i]}"
+        fi
+
+        echo "${CRYPTNAME}  ${SWAP_DEV_ID}  /dev/urandom  swap,cipher=aes-xts-plain64,size=512" \
+            >> /mnt/etc/crypttab
+        echo "/dev/mapper/${CRYPTNAME}  none  swap  defaults  0  0" \
+            >> /mnt/etc/fstab
+        log_info "Encrypted swap entry: $CRYPTNAME → $SWAP_DEV_ID"
+    done
+fi
+
+# mdadm config — write from live system so chroot initramfs picks it up
+if [[ "$NDISKS" -gt 1 ]]; then
+    mkdir -p /mnt/etc/mdadm
+    echo "HOMEHOST <ignore>" > /mnt/etc/mdadm/mdadm.conf
+    mdadm --detail --scan >> /mnt/etc/mdadm/mdadm.conf
+    log_info "mdadm.conf written"
 fi
 
 log_success "Pre-chroot configuration complete"
 
-# Bind-mount kernel virtual filesystems for chroot
+# Bind-mount kernel virtual filesystems
 mount --rbind /dev  /mnt/dev
 mount --rbind /proc /mnt/proc
 mount --rbind /sys  /mnt/sys
 
 ################################################################################
-# Step 10: Chroot — install kernel, ZFS, bootloader
+# Step 10: Install packages in chroot
 ################################################################################
 log_step "Step 10: Installing packages in chroot..."
 
-# Install kernel first so initramfs picks up ZFS modules later
+# Install kernel first so ZFS initramfs module is built against correct version
 chroot /mnt /bin/bash -e <<CHROOT_KERNEL
 set -e
 export DEBIAN_FRONTEND=noninteractive
@@ -609,12 +818,17 @@ apt-get update -qq
 apt-get install -y linux-image-generic linux-headers-generic
 CHROOT_KERNEL
 
-# Determine GRUB package for boot mode
+# Select GRUB variant
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
     GRUB_PKG="grub-efi-amd64 grub-efi-amd64-signed shim-signed"
 else
     GRUB_PKG="grub-pc"
 fi
+
+# Extra packages based on features selected
+EXTRA_PKGS="openssh-server dosfstools nano wget curl mc"
+[[ "$NDISKS" -gt 1 ]]       && EXTRA_PKGS+=" mdadm"
+[[ "$SWAP_SIZE" != "0" ]]   && EXTRA_PKGS+=" cryptsetup cryptsetup-initramfs"
 
 chroot /mnt /bin/bash -e <<CHROOT_PACKAGES
 set -e
@@ -622,12 +836,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get install -y \
     zfs-initramfs \
     $GRUB_PKG \
-    openssh-server \
-    dosfstools \
-    nano \
-    wget \
-    curl \
-    mc
+    $EXTRA_PKGS
 CHROOT_PACKAGES
 
 chroot /mnt /bin/bash -e <<CHROOT_LOCALE
@@ -640,7 +849,7 @@ echo "$TIMEZONE" > /etc/timezone
 dpkg-reconfigure -f noninteractive tzdata
 CHROOT_LOCALE
 
-log_success "Package installation complete"
+log_success "Packages installed"
 
 ################################################################################
 # Step 11: Create user and set passwords
@@ -656,24 +865,56 @@ log_success "User '$USERNAME' created"
 
 ################################################################################
 # Step 12: Configure bootloader
+#
+# Single disk:  standard GRUB install
+# Multi-disk:   UEFI → install GRUB on each disk's EFI partition in turn
+#               BIOS → install GRUB (MBR) on every disk
 ################################################################################
 log_step "Step 12: Configuring bootloader..."
 
 chroot /mnt zpool set cachefile=/etc/zfs/zpool.cache "$POOL_NAME"
-chroot /mnt update-initramfs -c -k all
+
+# Rebuild initramfs — includes ZFS, mdadm (if multi-disk), cryptsetup (if swap)
+if [[ "$NDISKS" -gt 1 ]]; then
+    chroot /mnt /bin/bash -e <<CHROOT_MDADM
+set -e
+mdadm --detail --scan > /etc/mdadm/mdadm.conf
+update-initramfs -c -k all
+CHROOT_MDADM
+else
+    chroot /mnt update-initramfs -c -k all
+fi
 
 if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    chroot /mnt grub-install \
-        --target=x86_64-efi \
-        --efi-directory=/boot/efi \
-        --bootloader-id=ubuntu \
-        --recheck
+    # Install GRUB on each disk's EFI partition
+    for (( i=0; i<${#EFI_PARTS[@]}; i++ )); do
+        # For i>0 we need to unmount the previous EFI and mount the current one
+        if [[ "$i" -gt 0 ]]; then
+            umount /mnt/boot/efi
+            mount "${EFI_PARTS[$i]}" /mnt/boot/efi
+        fi
+        chroot /mnt grub-install \
+            --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --bootloader-id=ubuntu \
+            --recheck
+        log_info "GRUB installed on EFI: ${EFI_PARTS[$i]}"
+    done
+    # Leave primary EFI mounted for update-grub
+    if [[ "${#EFI_PARTS[@]}" -gt 1 ]]; then
+        umount /mnt/boot/efi
+        mount "${EFI_PARTS[0]}" /mnt/boot/efi
+    fi
 else
-    chroot /mnt grub-install "$DISK"
+    # BIOS: install GRUB on every disk's MBR
+    for DISK in "${DISKS[@]}"; do
+        chroot /mnt grub-install "$DISK"
+        log_info "GRUB installed on: $DISK"
+    done
 fi
 
 chroot /mnt update-grub
-log_success "Bootloader installed"
+log_success "Bootloader configured"
 
 ################################################################################
 # Step 13: Enable ZFS services
@@ -682,49 +923,55 @@ log_step "Step 13: Enabling ZFS services..."
 chroot /mnt systemctl enable zfs-import-cache
 chroot /mnt systemctl enable zfs-mount
 chroot /mnt systemctl enable zfs.target
-[[ "$CREATE_SWAP" == "yes" ]] && chroot /mnt systemctl enable swap.target || true
 log_success "ZFS services enabled"
 
 ################################################################################
 # Step 14: Create initial installation snapshots
 ################################################################################
-log_step "Step 14: Creating initial installation snapshots..."
-SNAPSHOT_DATE=$(date +%Y%m%d-%H%M%S)
-SNAPSHOT_NAME="initial-install-${SNAPSHOT_DATE}"
+log_step "Step 14: Creating initial snapshots..."
+SNAPSHOT_NAME="initial-install-$(date +%Y%m%d-%H%M%S)"
 zfs snapshot -r "${POOL_NAME}@${SNAPSHOT_NAME}"
-log_success "Created snapshot: ${POOL_NAME}@${SNAPSHOT_NAME}"
+log_success "Snapshot created: ${POOL_NAME}@${SNAPSHOT_NAME}"
 zfs list -t snapshot -r "$POOL_NAME" | grep "$SNAPSHOT_NAME"
 
 ################################################################################
-# Step 15: Save disk configuration for post-boot reference
+# Step 15: Save disk configuration to /root/DISK_INFO.txt
 ################################################################################
-log_step "Step 15: Saving disk configuration to /root/DISK_INFO.txt..."
+log_step "Step 15: Saving disk configuration..."
 {
     echo "# Disk Configuration — generated $(date)"
     echo ""
-    echo "Installation Disk:          $DISK"
-    echo "Disk by-id:                 $DISK_BY_ID"
+    echo "Topology  : $POOL_TOPOLOGY"
+    echo "Boot mode : $BOOT_MODE"
+    echo "Network   : $NET_MODE"
+    [[ "$NET_MODE" == "static" ]] && echo "IP        : $NET_IP"
     echo ""
-    echo "Boot Partition:             $BOOT_PART"
-    echo "Boot Partition by-id:       $BOOT_PART_BY_ID"
-    echo "Boot Partition UUID:        $BOOT_UUID"
-    if [[ "$BOOT_MODE" == "UEFI" ]]; then
+    for i in "${!DISKS[@]}"; do
+        echo "Disk $((i+1)):"
+        echo "  Device      : ${DISKS[$i]}"
+        echo "  by-id       : ${DISK_IDS[$i]}"
+        if [[ "$BOOT_MODE" == "UEFI" && -n "${EFI_PARTS[$i]:-}" ]]; then
+            echo "  EFI part    : ${EFI_PARTS[$i]}"
+        fi
+        echo "  Boot part   : ${BOOT_PARTS[$i]}"
+        if [[ -n "${SWAP_PARTS[$i]:-}" ]]; then
+            echo "  Swap part   : ${SWAP_PARTS[$i]} (LUKS, random key per boot)"
+        fi
+        echo "  ZFS part    : ${ROOT_PARTS[$i]}"
+        echo "  ZFS by-id   : ${ROOT_IDS[$i]}"
         echo ""
-        echo "EFI Partition:              $EFI_PART"
-        echo "EFI Partition by-id:        $EFI_PART_BY_ID"
-        echo "EFI Partition UUID:         $EFI_UUID"
-    fi
-    echo ""
-    echo "Root Pool Partition:        $ROOT_PART"
-    echo "Root Pool Partition by-id:  $ROOT_PART_BY_ID"
-    echo "ZFS Pool Name:              $POOL_NAME"
+    done
+    echo "Boot device : $BOOT_DEV"
+    echo "Boot UUID   : $BOOT_UUID"
+    [[ -n "$EFI_UUID" ]] && echo "EFI UUID    : $EFI_UUID"
+    echo "ZFS pool    : $POOL_NAME"
     echo ""
     echo "# Useful commands"
     echo "zpool status $POOL_NAME"
     echo "zpool list -v $POOL_NAME"
-    echo "zpool status -P $POOL_NAME"
+    [[ "$NDISKS" -gt 1 ]] && echo "mdadm --detail /dev/md0"
     echo ""
-    echo "# Re-import pool by-id"
+    echo "# Re-import pool"
     echo "zpool export $POOL_NAME"
     echo "zpool import -d /dev/disk/by-id $POOL_NAME"
 } > /mnt/root/DISK_INFO.txt
@@ -734,53 +981,46 @@ log_success "Configuration saved to /root/DISK_INFO.txt"
 # Step 16: Cleanup and unmount
 ################################################################################
 log_step "Step 16: Unmounting filesystems and exporting pool..."
-CLEANUP_DONE=1  # Prevent the trap from running a second cleanup
+CLEANUP_DONE=1
 
 umount -R /mnt/dev  || true
 umount -R /mnt/proc || true
 umount -R /mnt/sys  || true
-
 [[ "$BOOT_MODE" == "UEFI" ]] && umount /mnt/boot/efi || true
 umount /mnt/boot || true
-
 zfs umount -a
 zpool export "$POOL_NAME"
+[[ "$NDISKS" -gt 1 ]] && mdadm --stop /dev/md0 || true
 log_success "Pool exported — installation complete!"
 
 ################################################################################
 # Summary
 ################################################################################
+SWAP_LABEL="$SWAP_SIZE per disk (LUKS, random key per boot)"
+[[ "$SWAP_SIZE" == "0" ]] && SWAP_LABEL="disabled"
+
 echo ""
 echo "==========================================================================="
 echo "  Installation Complete!"
 echo "==========================================================================="
 echo ""
-echo "Installed system:"
-echo "  Hostname     : $HOSTNAME"
-echo "  Username     : $USERNAME"
-echo "  Timezone     : $TIMEZONE"
-echo "  ZFS pool     : $POOL_NAME  (AES-256-GCM encrypted)"
-echo "  Compression  : $COMPRESSION_OPT"
-echo "  Swap volume  : $CREATE_SWAP"
-echo ""
-echo "Disk layout:"
-if [[ "$BOOT_MODE" == "UEFI" ]]; then
-    echo "  $EFI_PART   (UUID: $EFI_UUID) — EFI 512 MB FAT32"
-fi
-echo "  $BOOT_PART   (UUID: $BOOT_UUID) — /boot 2 GB ext4"
-echo "  $ROOT_PART   — ZFS encrypted root ($POOL_NAME)"
+echo "  Hostname   : $HOSTNAME"
+echo "  User       : $USERNAME"
+echo "  Timezone   : $TIMEZONE"
+echo "  ZFS pool   : $POOL_NAME  ($POOL_TOPOLOGY, AES-256-GCM encrypted)"
+echo "  Compress   : $COMPRESSION_OPT"
+echo "  Swap       : $SWAP_LABEL"
+echo "  Network    : $NET_MODE"
+[[ "$NET_MODE" == "static" ]] && echo "  IP address : $NET_IP  GW: $NET_GW"
+echo "  Disks      : ${#DISKS[@]} disk(s)"
 echo ""
 echo "IMPORTANT: Keep your ZFS passphrase safe — it cannot be recovered!"
 echo ""
-echo "Next steps after reboot:"
-echo "  1. Remove installation media"
-echo "  2. Reboot — enter your ZFS passphrase at the boot prompt"
-echo "  3. Log in as $USERNAME"
-echo "  4. sudo apt update && sudo apt upgrade"
-echo "  5. cat /root/DISK_INFO.txt   # full disk configuration"
-echo ""
 echo "==========================================================================="
 echo ""
+
+NET_LABEL="$NET_MODE"
+[[ "$NET_MODE" == "static" ]] && NET_LABEL="static  ($NET_IP)"
 
 whiptail \
     --title     "Installation Complete" \
@@ -790,12 +1030,15 @@ whiptail \
 
   Hostname : $HOSTNAME
   User     : $USERNAME
-  ZFS pool : $POOL_NAME (AES-256-GCM)
+  ZFS pool : $POOL_NAME ($POOL_TOPOLOGY, AES-256-GCM)
+  Swap     : $SWAP_LABEL
+  Network  : $NET_LABEL
+  Disks    : ${#DISKS[@]}
 
-Remove the installation media, then reboot.
+Remove installation media, then reboot.
 Enter your ZFS passphrase at the boot prompt.
 
 Reboot now?" \
-    15 60 || exit 0
+    18 65 || exit 0
 
 reboot
