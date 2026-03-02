@@ -119,6 +119,48 @@ if ! command -v whiptail &>/dev/null; then
     apt-get install -y whiptail
 fi
 
+################################################################################
+# Whiptail helper functions
+################################################################################
+
+# ask_input <title> <prompt> [default]
+#   Shows an inputbox; echoes the entered value.  Exits on Cancel.
+ask_input() {
+    local title="$1" prompt="$2" default="${3:-}"
+    local result
+    result=$(whiptail \
+        --title        "$title" \
+        --backtitle    "Ubuntu 24.04 Encrypted ZFS Installer" \
+        --inputbox     "$prompt" 10 60 "$default" \
+        3>&1 1>&2 2>&3) || { log_info "Cancelled."; exit 0; }
+    echo "$result"
+}
+
+# ask_password <title> <prompt>
+#   Shows a passwordbox; echoes the entered value.  Exits on Cancel.
+ask_password() {
+    local title="$1" prompt="$2"
+    whiptail \
+        --title        "$title" \
+        --backtitle    "Ubuntu 24.04 Encrypted ZFS Installer" \
+        --passwordbox  "$prompt" 10 60 \
+        3>&1 1>&2 2>&3 || { log_info "Cancelled."; exit 0; }
+}
+
+# ask_yesno <title> <prompt> [default_no=false]
+#   Returns 0 for Yes, 1 for No.
+ask_yesno() {
+    local title="$1" prompt="$2" default_no="${3:-false}"
+    local flag=""
+    [[ "$default_no" == "true" ]] && flag="--defaultno"
+    # shellcheck disable=SC2086
+    whiptail \
+        --title     "$title" \
+        --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
+        $flag --yesno "$prompt" 12 70
+}
+
+################################################################################
 # Build whiptail menu items:
 #   TAG  = /dev/disk/by-id/...  (or /dev/sdX if no by-id found)
 #   ITEM = /dev/sda  500G  Samsung SSD 850 PRO
@@ -188,10 +230,16 @@ fi
 log_info "Selected disk:       $DISK"
 log_info "Disk identifier:     $DISK_BY_ID"
 
-echo ""
-log_warning "ALL DATA ON $DISK WILL BE PERMANENTLY DESTROYED!"
-read -rp "Are you sure you want to continue? (yes/no): " CONFIRM
-if [[ "$CONFIRM" != "yes" ]]; then
+if ! ask_yesno "CONFIRM DESTRUCTIVE OPERATION" \
+"ALL DATA ON THE FOLLOWING DISK WILL BE PERMANENTLY DESTROYED:
+
+  $DISK
+  ($DISK_BY_ID)
+
+This operation CANNOT be undone!
+
+Are you absolutely sure you want to continue?" \
+"true"; then
     log_info "Installation cancelled."
     exit 0
 fi
@@ -199,39 +247,60 @@ fi
 ################################################################################
 # User configuration prompts
 ################################################################################
-echo ""
-read -rp  "Enter hostname for the new system: "     HOSTNAME
-read -rp  "Enter username for the new user: "       USERNAME
-read -rsp "Enter password for $USERNAME: "          USER_PASSWORD; echo ""
-read -rsp "Confirm password for $USERNAME: "        USER_PASSWORD_CONFIRM; echo ""
-if [[ "$USER_PASSWORD" != "$USER_PASSWORD_CONFIRM" ]]; then
-    log_error "Passwords do not match!"
-    exit 1
-fi
 
-read -rsp "Enter ZFS encryption passphrase: "       ZFS_PASSPHRASE; echo ""
-read -rsp "Confirm ZFS encryption passphrase: "     ZFS_PASSPHRASE_CONFIRM; echo ""
-if [[ "$ZFS_PASSPHRASE" != "$ZFS_PASSPHRASE_CONFIRM" ]]; then
-    log_error "Passphrases do not match!"
-    exit 1
-fi
+HOSTNAME=$(ask_input "System Configuration" \
+    "Enter hostname for the new system:" "ubuntu-zfs")
+[[ -z "$HOSTNAME" ]] && { log_error "Hostname cannot be empty!"; exit 1; }
+
+USERNAME=$(ask_input "System Configuration" \
+    "Enter username for the new user:" "")
+[[ -z "$USERNAME" ]] && { log_error "Username cannot be empty!"; exit 1; }
+
+while true; do
+    USER_PASSWORD=$(ask_password "User Password" \
+        "Enter password for '$USERNAME':")
+    USER_PASSWORD_CONFIRM=$(ask_password "User Password" \
+        "Confirm password for '$USERNAME':")
+    [[ "$USER_PASSWORD" == "$USER_PASSWORD_CONFIRM" ]] && break
+    whiptail --title "Error" \
+        --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
+        --msgbox "Passwords do not match. Please try again." 8 50
+done
+
+while true; do
+    ZFS_PASSPHRASE=$(ask_password "ZFS Encryption" \
+        "Enter ZFS encryption passphrase:")
+    ZFS_PASSPHRASE_CONFIRM=$(ask_password "ZFS Encryption" \
+        "Confirm ZFS encryption passphrase:")
+    [[ "$ZFS_PASSPHRASE" == "$ZFS_PASSPHRASE_CONFIRM" ]] && break
+    whiptail --title "Error" \
+        --backtitle "Ubuntu 24.04 Encrypted ZFS Installer" \
+        --msgbox "Passphrases do not match. Please try again." 8 50
+done
 
 ################################################################################
 # Optional features
 ################################################################################
-echo ""
-log_info "ZFS Performance Options:"
-read -rp "Enable ZFS compression (lz4)? (yes/no, default: yes): " ENABLE_COMPRESSION
-ENABLE_COMPRESSION="${ENABLE_COMPRESSION:-yes}"
-COMPRESSION_OPT="off"
-[[ "$ENABLE_COMPRESSION" == "yes" ]] && COMPRESSION_OPT="lz4"
 
-echo ""
-read -rp "Create a ZFS swap volume (4GB)? (yes/no, default: no): " CREATE_SWAP
-CREATE_SWAP="${CREATE_SWAP:-no}"
+if ask_yesno "ZFS Options" \
+"Enable ZFS compression (lz4)?
 
-echo ""
-read -rp "Enter timezone (e.g. Europe/Budapest, UTC) [default: UTC]: " TIMEZONE
+Recommended: reduces disk usage with minimal CPU overhead."; then
+    ENABLE_COMPRESSION="yes"
+    COMPRESSION_OPT="lz4"
+else
+    ENABLE_COMPRESSION="no"
+    COMPRESSION_OPT="off"
+fi
+
+if ask_yesno "ZFS Options" "Create a ZFS swap volume (4 GB)?"; then
+    CREATE_SWAP="yes"
+else
+    CREATE_SWAP="no"
+fi
+
+TIMEZONE=$(ask_input "System Configuration" \
+    "Enter timezone (e.g. Europe/Budapest, America/New_York, UTC):" "UTC")
 TIMEZONE="${TIMEZONE:-UTC}"
 
 ################################################################################
