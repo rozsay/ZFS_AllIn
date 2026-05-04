@@ -1,0 +1,166 @@
+# ZFS_AllIn — ZFS-root.conf example / template
+# Copyright (C) 2025 rozsay
+#
+# Copy this file to ZFS-root.conf and adjust to your needs.
+# The installer reads this file and skips interactive prompts for any
+# value that is pre-filled here.  Leave a value empty ("") to be asked.
+#
+# Usage:
+#   cp ZFS-root.conf.example ZFS-root.conf
+#   $EDITOR ZFS-root.conf
+#   sudo bash ubuntu-zfs-root.sh initial
+
+###############################################################################
+# Installation mode
+###############################################################################
+
+# Wipe disks and do a full fresh install?
+#   y — full install (wipes selected disks completely)
+#   n — only create a new <poolname>/ROOT/<suite> dataset on an existing pool
+#       (useful for adding another Ubuntu version alongside the current one)
+WIPE_FRESH=y
+
+###############################################################################
+# Ubuntu version
+###############################################################################
+
+# Ubuntu codename to install
+#   noble    — 24.04 LTS  (current)
+#   resolute — 26.04 LTS  (next)
+#   jammy    — 22.04 LTS  (previous)
+SUITE="noble"
+
+###############################################################################
+# System identity
+###############################################################################
+
+MYHOSTNAME="my-zfs-server"
+POOLNAME="rpool"
+
+###############################################################################
+# User account
+###############################################################################
+
+USERNAME="sa"
+UCOMMENT="System Administrator"
+
+# Password (leave empty to be prompted interactively)
+# WARNING: storing a password in plain text here is convenient but insecure.
+# Anyone who can read this file can read the password.
+UPASSWORD=""
+
+###############################################################################
+# Storage topology
+###############################################################################
+
+# Root pool RAID level
+#   single  — 1 disk, no redundancy
+#   mirror  — 2 disks, tolerates 1 failure
+#   raidz1  — 3+ disks, tolerates 1 failure
+#   raidz2  — 4+ disks, tolerates 2 failures
+#   raidz3  — 5+ disks, tolerates 3 failures
+#   raid0   — 2+ disks, stripe (no redundancy, maximum capacity)
+RAIDLEVEL="mirror"
+
+###############################################################################
+# Swap
+###############################################################################
+
+# Swap size in megabytes per disk.  Set to 0 to disable swap entirely.
+# For hibernation, set to at least your total RAM size.
+# With LUKS: swap lives on a dedicated LUKS-encrypted partition.
+# With NOENC/ZFSENC: a ZFS zvol is used instead.
+SIZE_SWAP=4096
+
+###############################################################################
+# Disk encryption
+###############################################################################
+
+# Encryption method:
+#   NOENC  — no encryption
+#   ZFSENC — ZFS native AES-256-GCM encryption (passphrase at pool level)
+#   LUKS   — LUKS2 whole-disk encryption (ZFS sits on top of /dev/mapper/…)
+DISCENC="ZFSENC"
+
+# Encryption passphrase (leave empty to be prompted)
+PASSPHRASE=""
+
+# Install Dropbear SSH in the initramfs for remote unlock at boot?
+#   y — ssh -p 2222 root@<ip> then run: zfsunlock
+#   n — unlock only via physical console
+# Only relevant when DISCENC != NOENC.
+DROPBEAR=y
+
+###############################################################################
+# Optional features
+###############################################################################
+
+# Create a rescue clone of the base install snapshot?
+#   Creates: <poolname>/ROOT/<suite>_rescue_base  (bootable fallback)
+RESCUE=y
+
+# Install Google Authenticator (TOTP) for SSH logins without a key?
+GOOGLE=n
+
+# Install HWE (Hardware Enablement) kernel instead of the GA kernel?
+HWE=y
+
+# Install zrepl for periodic 15-minute snapshots with retention pruning?
+# Sanoid is always configured regardless of this setting.
+ZREPL=y
+
+# NVIDIA driver version.  "none" to skip.
+# Installed package will be: nvidia-driver-${NVIDIA}
+#   none  — no NVIDIA driver
+#   470   — legacy (Kepler)
+#   525   — 525.x series
+#   550   — current recommended
+#   570   — latest
+NVIDIA=none
+
+# Extra packages to install (space-separated)
+NECESSARY_PACKAGES="mc 7zip openssh-server"
+
+###############################################################################
+# SSH configuration
+###############################################################################
+
+# Public key to add to ~<username>/.ssh/authorized_keys
+# Paste the full key string (e.g. "ssh-ed25519 AAAA... user@host")
+SSHPUBKEY=""
+
+# Pre-defined host keys — handy for repeated test installs so you don't
+# have to edit ~/.ssh/known_hosts each time.  Leave empty to auto-generate.
+HOST_ECDSA_KEY=""
+HOST_ECDSA_KEY_PUB=""
+HOST_RSA_KEY=""
+HOST_RSA_KEY_PUB=""
+HOST_ED25519_KEY=""
+HOST_ED25519_KEY_PUB=""
+
+###############################################################################
+# Network
+###############################################################################
+
+# dhcp — use DHCP (default)
+# static — configure a static IP (fill NET_IP, NET_GW, NET_DNS below)
+NET_MODE="dhcp"
+
+NET_IP=""           # e.g. 192.168.1.10/24
+NET_GW=""           # e.g. 192.168.1.1
+NET_DNS="8.8.8.8,1.1.1.1"
+
+###############################################################################
+# Locale / timezone
+###############################################################################
+
+TIMEZONE="UTC"
+# Other examples: Europe/Budapest  America/New_York  Asia/Tokyo
+
+###############################################################################
+# Logging
+###############################################################################
+
+# Directory where install logs are written.
+# Each run creates a timestamped file: install-YYYYMMDD-HHMMSS.log
+LOGDIR="/var/log/zfs-allin"

@@ -30,23 +30,67 @@ When code is added, update this file to reflect:
 
 ---
 
-## Directory Structure (Planned)
-
-Once development begins, follow a structure appropriate to the implementation
-language. Common patterns for ZFS tooling projects:
+## Directory Structure
 
 ```
 ZFS_AllIn/
-├── CLAUDE.md           # This file
-├── LICENSE             # GPL v3
-├── README.md           # User-facing documentation (create when code exists)
-├── src/                # Source code
-├── tests/              # Unit and integration tests
-├── scripts/            # Helper scripts
-└── docs/               # Additional documentation
+├── CLAUDE.md                            # This file
+├── LICENSE                              # GPL v3
+├── ubuntu-zfs-root.sh                   # Main all-in-one ZFS installer
+├── ZFS-root.conf.example                # Example/template config file
+└── install-ubuntu-zfs-encrypted-ext4boot.sh  # Earlier single-purpose installer
 ```
 
-Update this section when the actual structure is established.
+### Main Script: `ubuntu-zfs-root.sh`
+
+All-in-one Ubuntu-on-ZFS installer.  Subcommands:
+
+| Command | When to run |
+|---|---|
+| `initial` | From Ubuntu Live USB — partitions disks and installs the OS |
+| `postreboot` | After first login on the new system |
+| `remoteaccess` | To enable Dropbear SSH for remote unlock at boot |
+| `datapool` | To create an additional ZFS data pool |
+
+**Key features implemented:**
+- Ubuntu noble (24.04), resolute (26.04), jammy (22.04)
+- Root pool topologies: single, mirror, raid0, raidz1, raidz2, raidz3
+- Encryption: NOENC / ZFSENC (native AES-256-GCM) / LUKS (whole-disk)
+- Remote unlock at boot via Dropbear SSH (port 2222)
+- Sanoid automatic snapshot management with timer + APT pre-invoke hook
+- zrepl periodic snapshots with configurable retention (optional)
+- Google Authenticator TOTP for SSH (optional)
+- UEFI (GRUB + efibootmgr) and BIOS boot
+- `WIPE_FRESH=n` mode: add a new distro dataset to an existing pool
+- Rescue clone dataset created from base install snapshot
+- Additional data pool creation with independent encryption and topology
+- Config pre-seeding via `ZFS-root.conf` (see `ZFS-root.conf.example`)
+- DEBUG mode: `DEBUG=1 sudo bash ubuntu-zfs-root.sh initial`
+- All operations logged to `/var/log/zfs-allin/`
+
+### Dataset layout (example: pool=rpool, suite=noble)
+
+```
+rpool/ROOT                          # container (canmount=off)
+rpool/ROOT/noble                    # root filesystem
+rpool/ROOT/noble@base_install       # snapshot at install completion
+rpool/ROOT/noble_rescue_base        # clone of base_install (if RESCUE=y)
+rpool/ROOT/noble@apt_YYYY-MM-DD-…  # auto-snapshot before apt operations
+rpool/home                          # home container
+rpool/home/root                     # /root
+rpool/home/<username>               # /home/<username>
+rpool/usr                           # container
+rpool/usr/local                     # /usr/local
+rpool/var                           # container
+rpool/var/lib                       # /var/lib
+rpool/var/log                       # /var/log
+rpool/var/mail                      # /var/mail
+rpool/var/snap                      # /var/snap
+rpool/var/spool                     # /var/spool
+rpool/var/www                       # /var/www
+rpool/docker                        # Docker data (auto-snapshot=false)
+rpool/swap                          # ZFS zvol swap (NOENC/ZFSENC only)
+```
 
 ---
 
@@ -164,22 +208,20 @@ Placeholder (update when tests are written):
 
 ## Build / Install
 
-No build system exists yet. When added, document here:
-- Prerequisites / system dependencies
-- How to build from source
-- How to install
-- How to run in development mode
+The project is a set of bash scripts — no build step required.
 
-Placeholder (update when build system is set up):
 ```bash
-# Install dependencies
-<command TBD>
+# Prerequisites (installed automatically by the script if missing)
+# debootstrap zfsutils-linux sgdisk cryptsetup whiptail efibootmgr
 
-# Build
-<command TBD>
+# Run the installer from an Ubuntu Live USB:
+sudo bash ubuntu-zfs-root.sh initial
 
-# Install locally
-<command TBD>
+# Post-reboot (on the new system):
+sudo bash ubuntu-zfs-root.sh postreboot
+
+# Optional: static analysis with shellcheck
+shellcheck ubuntu-zfs-root.sh
 ```
 
 ---
