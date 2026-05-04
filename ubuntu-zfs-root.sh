@@ -1019,9 +1019,9 @@ EOF
     # vm.swappiness tweak
     echo "vm.swappiness=10" > /mnt/etc/sysctl.d/99-zfs-allin.conf
 
-    # ZFS pool cache
+    # ZFS pool cache — must point inside /mnt so the chroot sees it as /etc/zfs/zpool.cache
     mkdir -p /mnt/etc/zfs
-    zpool set cachefile=/etc/zfs/zpool.cache "$POOLNAME"
+    zpool set cachefile=/mnt/etc/zfs/zpool.cache "$POOLNAME"
 
     log_success "Pre-chroot config done"
 }
@@ -1060,7 +1060,8 @@ install_packages_chroot() {
 
     local enc_pkgs=""
     [[ "$DISCENC" == "LUKS" ]] && enc_pkgs="cryptsetup cryptsetup-initramfs"
-    [[ "$DROPBEAR" == "y" ]]   && enc_pkgs+=" dropbear-initramfs"
+    # dropbear-initramfs is intentionally installed later in configure_dropbear()
+    # so that authorized_keys is written before the first initramfs build.
 
     local opt_pkgs="sanoid openssh-server curl wget nano"
     [[ -n "${NECESSARY_PACKAGES:-}" ]] && opt_pkgs+=" ${NECESSARY_PACKAGES}"
@@ -1074,15 +1075,30 @@ apt-get update -qq
 apt-get install -y ${kernel_pkg}
 apt-get install -y ${boot_pkgs} ${enc_pkgs} ${opt_pkgs}
 
-# zrepl from its own repo if requested
+# zrepl from its own repo if requested.
+# The zrepl apt repo may not publish packages for every Ubuntu suite;
+# probe the InRelease URL first and fall back to "noble" if the suite
+# is not listed, rather than letting curl exit non-zero and abort the install.
 if [[ "${ZREPL}" == "y" ]]; then
-    curl -fsSL https://zrepl.github.io/apt/apt.gpg \
-        | gpg --dearmor > /etc/apt/trusted.gpg.d/zrepl.gpg 2>/dev/null || true
-    echo "deb https://zrepl.github.io/apt/ ${SUITE} main" \
-        > /etc/apt/sources.list.d/zrepl.list 2>/dev/null || true
-    apt-get update -qq 2>/dev/null || true
-    apt-get install -y zrepl 2>/dev/null \
-        || echo "[WARNING] zrepl not available for this suite, skipping"
+    ZREPL_BASE="https://zrepl.github.io/apt"
+    ZREPL_SUITE="${SUITE}"
+    if curl -fsSL "${ZREPL_BASE}/apt.gpg" \
+            | gpg --dearmor > /etc/apt/trusted.gpg.d/zrepl.gpg 2>/dev/null; then
+        # Check whether the suite-specific repo exists; fall back to noble
+        if ! curl -fsSL --head \
+                "${ZREPL_BASE}/dists/${ZREPL_SUITE}/InRelease" \
+                -o /dev/null 2>/dev/null; then
+            echo "[INFO] zrepl repo has no packages for ${ZREPL_SUITE}, using noble"
+            ZREPL_SUITE="noble"
+        fi
+        echo "deb ${ZREPL_BASE}/ ${ZREPL_SUITE} main" \
+            > /etc/apt/sources.list.d/zrepl.list
+        apt-get update -qq 2>/dev/null || true
+        apt-get install -y zrepl 2>/dev/null \
+            || echo "[WARNING] zrepl install failed, skipping"
+    else
+        echo "[WARNING] Could not fetch zrepl GPG key — skipping zrepl"
+    fi
 fi
 
 locale-gen en_US.UTF-8
@@ -1193,12 +1209,16 @@ configure_dropbear() {
     [[ "$DROPBEAR" != "y" ]] && return
     log_step "Configuring Dropbear initramfs SSH"
 
+    # Install dropbear-initramfs HERE — after authorized_keys is written below —
+    # so that the first update-initramfs triggered by the package sees a valid key
+    # and does not emit "Invalid authorized_keys" warnings.
     mkdir -p /mnt/etc/dropbear/initramfs
 
+    # Write authorized_keys BEFORE installing the package
     if [[ -n "${SSHPUBKEY:-}" ]]; then
         echo "$SSHPUBKEY" > /mnt/etc/dropbear/initramfs/authorized_keys
     else
-        log_warning "No SSH public key provided — generating a one-time unlock key pair"
+        log_warning "No SSH public key — generating a one-time unlock key pair"
         ssh-keygen -t ed25519 -f /tmp/dropbear_unlock -N "" -C "zfs-allin-unlock" \
             -q 2>/dev/null
         cp /tmp/dropbear_unlock.pub /mnt/etc/dropbear/initramfs/authorized_keys
@@ -1212,14 +1232,21 @@ configure_dropbear() {
 DROPBEAR_OPTIONS="-p 2222 -s -j -k -I 60"
 EOF
 
-    # Enable DROPBEAR in initramfs config
+    # Enable DROPBEAR flag before the package triggers update-initramfs
     if grep -q "^DROPBEAR=" /mnt/etc/initramfs-tools/initramfs.conf 2>/dev/null; then
         sed -i 's/^DROPBEAR=.*/DROPBEAR=y/' /mnt/etc/initramfs-tools/initramfs.conf
     else
         echo "DROPBEAR=y" >> /mnt/etc/initramfs-tools/initramfs.conf
     fi
 
-    # zfsunlock helper script
+    # Now install — the package's post-install trigger runs update-initramfs
+    # and will find the already-valid authorized_keys
+    chroot /mnt /bin/bash -e <<'DROPBEAR_INSTALL'
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y dropbear-initramfs
+DROPBEAR_INSTALL
+
+    # zfsunlock helper script (used inside the initramfs SSH session)
     cat > /mnt/usr/local/bin/zfsunlock <<'ZFSEOF'
 #!/bin/bash
 # Unlock ZFS encryption from Dropbear SSH session at boot
@@ -1316,43 +1343,69 @@ TEOF
 ###############################################################################
 # Bootloader
 ###############################################################################
+# _efi_partnum <partition-device>  →  prints the partition number (works for
+# both /dev/sda1 and /dev/nvme0n1p1 by reading the kernel attribute directly).
+_efi_partnum() {
+    local part="$1"
+    cat "/sys/class/block/$(basename "$part")/partition" 2>/dev/null || echo "1"
+}
+
+# _efi_bootmgr_entry <disk> <efi-part> <label>
+_efi_bootmgr_entry() {
+    local disk="$1" efi_part="$2" label="$3"
+    local partnum; partnum=$(_efi_partnum "$efi_part")
+    efibootmgr --create \
+        --disk "$disk" \
+        --part "$partnum" \
+        --label "$label" \
+        --loader '\EFI\ubuntu\shimx64.efi' \
+        2>/dev/null \
+        && log_info "efibootmgr entry: $label" \
+        || log_warning "efibootmgr failed for $disk (skip in non-UEFI env)"
+}
+
 install_bootloader() {
     log_step "Installing bootloader"
 
     chroot /mnt update-initramfs -c -k all
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
-        for i in "${!EFI_PARTS[@]}"; do
-            [[ $i -gt 0 ]] && { umount /mnt/boot/efi; mount "${EFI_PARTS[$i]}" /mnt/boot/efi; }
-            chroot /mnt grub-install \
-                --target=x86_64-efi \
-                --efi-directory=/boot/efi \
-                --bootloader-id=ubuntu \
-                --recheck
-            # Register EFI entry with efibootmgr for this disk
-            local disk="${DISKS[$i]}"
-            local efi_dev="${EFI_PARTS[$i]}"
-            local efi_partnum="${efi_dev##*[a-z]}"
-            efibootmgr --create \
-                --disk "$disk" \
-                --part "$efi_partnum" \
-                --label "Ubuntu ZFS (${disk##*/})" \
-                --loader '\EFI\ubuntu\shimx64.efi' \
-                2>/dev/null || true
-            log_info "GRUB + efibootmgr on ${EFI_PARTS[$i]}"
+        # Primary disk: full GRUB install with explicit device argument.
+        # Passing the disk prevents the "More than one install device?" error
+        # that occurs when grub-install auto-scans and finds multiple FAT32/EF00
+        # partitions across the member disks.
+        chroot /mnt grub-install \
+            --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --bootloader-id=ubuntu \
+            --recheck \
+            "${DISKS[0]}"
+        chroot /mnt update-grub
+        _efi_bootmgr_entry "${DISKS[0]}" "${EFI_PARTS[0]}" "Ubuntu ZFS"
+        log_info "GRUB installed on primary EFI: ${EFI_PARTS[0]}"
+
+        # Additional disks: copy the EFI tree instead of re-running grub-install.
+        # This avoids the multi-device confusion and keeps all ESPs in sync.
+        for i in $(seq 1 $((${#EFI_PARTS[@]} - 1))); do
+            local tmp="/mnt/boot/efi_tmp${i}"
+            mkdir -p "$tmp"
+            mount "${EFI_PARTS[$i]}" "$tmp"
+            mkdir -p "${tmp}/EFI/ubuntu"
+            cp -a /mnt/boot/efi/EFI/ubuntu/. "${tmp}/EFI/ubuntu/"
+            umount "$tmp" && rmdir "$tmp"
+            _efi_bootmgr_entry "${DISKS[$i]}" "${EFI_PARTS[$i]}" \
+                "Ubuntu ZFS (${DISKS[$i]##*/})"
+            log_info "EFI files mirrored to: ${EFI_PARTS[$i]}"
         done
-        if [[ "${#EFI_PARTS[@]}" -gt 1 ]]; then
-            umount /mnt/boot/efi
-            mount "${EFI_PARTS[0]}" /mnt/boot/efi
-        fi
     else
+        # BIOS: write GRUB to the MBR of every member disk
         for disk in "${DISKS[@]}"; do
             chroot /mnt grub-install "$disk"
             log_info "GRUB installed on: $disk"
         done
+        chroot /mnt update-grub
     fi
 
-    chroot /mnt update-grub
     log_success "Bootloader installed"
 }
 
@@ -1826,7 +1879,7 @@ cmd_datapool() {
         log_info "Auto-unlock key: $key_file"
     fi
 
-    zpool set cachefile=/etc/zfs/zpool.cache "$dpool"
+    zpool set cachefile=/etc/zfs/zpool.cache "$dpool" 2>/dev/null || true
     systemctl enable zfs-import-cache zfs-mount zfs.target 2>/dev/null || true
 
     log_success "Data pool '$dpool' ready"
