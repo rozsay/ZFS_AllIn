@@ -193,21 +193,87 @@ wt_msg() {
 # Utility helpers
 ###############################################################################
 check_root() {
-    [[ $EUID -eq 0 ]] || { log_error "Run as root: sudo bash $SCRIPT_NAME $*"; exit 1; }
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}[ERROR]${NC} This script must be run as root."
+        echo -e "        Re-run with: ${BOLD}sudo bash $SCRIPT_NAME $*${NC}"
+        exit 1
+    fi
 }
 
 die() { log_error "$1"; exit 1; }
 
+# check_deps — verify and install all required tools before any work begins.
+#
+# Maps each required binary to the apt package that provides it.
+# Separates "always needed" tools from conditional ones (LUKS, UEFI, Dropbear).
+# Reports every missing package at once, then offers to install them in a
+# single apt-get run rather than failing on the first missing tool.
 check_deps() {
-    local deps=("whiptail" "sgdisk" "zpool" "zfs" "debootstrap" "curl")
-    [[ "$DISCENC" == "LUKS" ]] && deps+=("cryptsetup")
-    local missing=()
-    for dep in "${deps[@]}"; do command -v "$dep" &>/dev/null || missing+=("$dep"); done
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_info "Installing: ${missing[*]}"
-        apt-get update -qq
-        apt-get install -y "${missing[@]}" || die "Failed to install: ${missing[*]}"
+    # binary_name:apt_package  (same string when they match)
+    local -a always_needed=(
+        "whiptail:whiptail"
+        "sgdisk:gdisk"
+        "zpool:zfsutils-linux"
+        "zfs:zfsutils-linux"
+        "mkfs.vfat:dosfstools"
+        "debootstrap:debootstrap"
+        "curl:curl"
+        "wget:wget"
+        "lsblk:util-linux"
+        "wipefs:util-linux"
+        "partprobe:parted"
+        "udevadm:udev"
+    )
+
+    local -a conditional=()
+    [[ "$DISCENC" == "LUKS" ]]  && conditional+=("cryptsetup:cryptsetup-bin")
+    [[ "$BOOT_MODE" == "UEFI" ]] && conditional+=("efibootmgr:efibootmgr")
+    [[ "$DROPBEAR" == "y" ]]    && conditional+=("dropbear:dropbear-initramfs")
+
+    local -a all_pairs=("${always_needed[@]}" "${conditional[@]}")
+    local -a missing_bins=()
+    local -a missing_pkgs=()
+
+    log_step "Dependency check"
+
+    for pair in "${all_pairs[@]}"; do
+        local bin="${pair%%:*}"
+        local pkg="${pair##*:}"
+        if ! command -v "$bin" &>/dev/null; then
+            missing_bins+=("$bin")
+            # Avoid duplicate package names
+            local already=0
+            for p in "${missing_pkgs[@]:-}"; do [[ "$p" == "$pkg" ]] && already=1; done
+            [[ $already -eq 0 ]] && missing_pkgs+=("$pkg")
+        else
+            log_debug "OK  $bin"
+        fi
+    done
+
+    if [[ ${#missing_bins[@]} -eq 0 ]]; then
+        log_success "All dependencies satisfied"
+        return 0
     fi
+
+    # Report what is missing
+    log_warning "Missing tools: ${missing_bins[*]}"
+    log_info    "Required packages: ${missing_pkgs[*]}"
+
+    apt-get update -qq || die "apt-get update failed — check your internet connection"
+    apt-get install -y "${missing_pkgs[@]}" \
+        || die "Failed to install: ${missing_pkgs[*]}"
+
+    # Verify everything is actually available now
+    local still_missing=()
+    for pair in "${all_pairs[@]}"; do
+        local bin="${pair%%:*}"
+        command -v "$bin" &>/dev/null || still_missing+=("$bin")
+    done
+    if [[ ${#still_missing[@]} -gt 0 ]]; then
+        die "Still missing after install: ${still_missing[*]}\nAbort."
+    fi
+
+    log_success "All dependencies installed successfully"
 }
 
 get_part() {
@@ -1559,6 +1625,7 @@ cmd_remoteaccess() {
     log_step "ZFS AllIn — Remote Access (Dropbear)"
     check_root
     load_config
+    DROPBEAR="y" check_deps
 
     dpkg -l dropbear-initramfs &>/dev/null || apt-get install -y dropbear-initramfs
     mkdir -p /etc/dropbear/initramfs
@@ -1627,6 +1694,7 @@ cmd_datapool() {
     log_step "ZFS AllIn — Data Pool Setup"
     check_root
     load_config
+    check_deps
 
     local dpool
     dpool=$(wt_input "Data Pool" "Name for the new data pool:" "data")
@@ -1809,11 +1877,19 @@ EOF
 ###############################################################################
 # Entry point
 ###############################################################################
+# Root check before anything else — setup_logging needs mkdir (root-only dir)
+if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}[ERROR]${NC} This script must be run as root."
+    echo -e "        Re-run with: ${BOLD}sudo bash $SCRIPT_NAME ${1:-}${NC}"
+    exit 1
+fi
+
 # Load config early (before logging) so LOGDIR can be overridden
 [[ -f "${CONFIG_FILE}" ]] && source "${CONFIG_FILE}" 2>/dev/null || true
 
-# Ensure whiptail is available
-command -v whiptail &>/dev/null || { apt-get update -qq; apt-get install -y whiptail; }
+# Ensure whiptail is available before we can use the TUI
+command -v whiptail &>/dev/null \
+    || { apt-get update -qq; apt-get install -y whiptail; }
 
 setup_logging
 
