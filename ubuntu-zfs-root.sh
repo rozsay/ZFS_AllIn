@@ -953,7 +953,7 @@ setup_boot_partitions() {
 ###############################################################################
 install_base_system() {
     log_step "Installing Ubuntu $SUITE via debootstrap"
-    debootstrap --mirror="http://archive.ubuntu.com/ubuntu" "$SUITE" /mnt
+    debootstrap "$SUITE" /mnt "http://archive.ubuntu.com/ubuntu"
     log_success "Base system installed"
 }
 
