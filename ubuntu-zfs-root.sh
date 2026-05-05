@@ -907,19 +907,27 @@ create_datasets() {
 setup_boot_partitions() {
     log_step "Setting up boot partitions"
 
+    # Format all boot partitions (needed before any mount)
+    for part in "${BOOT_PARTS[@]}"; do
+        mkfs.ext4 -F -L boot "$part"
+    done
+
+    # Mount /boot FIRST — /boot/efi must be a subdirectory of the mounted
+    # ext4 /boot, not a pre-existing mountpoint on the bare ZFS tree.
+    # Mounting /boot/efi before /boot would have /boot mounted over it,
+    # silently hiding the EFI partition and causing "failed to get canonical
+    # path of /boot/efi" in grub-install.
+    mkdir -p /mnt/boot
+    mount "${BOOT_PARTS[0]}" /mnt/boot
+
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
         for part in "${EFI_PARTS[@]}"; do
             mkfs.vfat -F32 -n EFI "$part"
         done
+        # Create the directory inside the already-mounted /boot, then mount EFI
         mkdir -p /mnt/boot/efi
         mount "${EFI_PARTS[0]}" /mnt/boot/efi
     fi
-
-    for part in "${BOOT_PARTS[@]}"; do
-        mkfs.ext4 -F -L boot "$part"
-    done
-    mkdir -p /mnt/boot
-    mount "${BOOT_PARTS[0]}" /mnt/boot
 
     log_success "Boot partitions ready"
 }
@@ -1041,6 +1049,16 @@ EOF
     # ZFS pool cache — must point inside /mnt so the chroot sees it as /etc/zfs/zpool.cache
     mkdir -p /mnt/etc/zfs
     zpool set cachefile=/mnt/etc/zfs/zpool.cache "$POOLNAME"
+
+    # Stub files expected by the zfs-initramfs mkinitramfs hook.
+    # Without them mkinitramfs emits harmless but noisy "copy_file: not found"
+    # warnings for each absent file during every initramfs rebuild.
+    #   vdev_id.conf              — persistent disk aliases (not needed here)
+    #   initramfs-tools-load-key  — custom key-load hook (passphrase prompt
+    #                               is handled by ZFS initramfs automatically)
+    touch /mnt/etc/zfs/vdev_id.conf
+    touch /mnt/etc/zfs/initramfs-tools-load-key
+    mkdir -p /mnt/etc/zfs/initramfs-tools-load-key.d
 
     log_success "Pre-chroot config done"
 }
