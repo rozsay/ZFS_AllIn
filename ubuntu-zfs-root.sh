@@ -1084,24 +1084,17 @@ apt-get update -qq
 apt-get install -y ${kernel_pkg}
 apt-get install -y ${boot_pkgs} ${enc_pkgs} ${opt_pkgs}
 
-# zrepl from its own repo if requested.
-# The zrepl apt repo may not publish packages for every Ubuntu suite;
-# probe the InRelease URL first and fall back to "noble" if the suite
-# is not listed, rather than letting curl exit non-zero and abort the install.
+# zrepl — official repo at zrepl.cschwarz.com
 if [[ "${ZREPL}" == "y" ]]; then
-    ZREPL_BASE="https://zrepl.github.io/apt"
-    ZREPL_SUITE="${SUITE}"
-    if curl -fsSL "${ZREPL_BASE}/apt.gpg" \
-            | gpg --dearmor > /etc/apt/trusted.gpg.d/zrepl.gpg 2>/dev/null; then
-        # Check whether the suite-specific repo exists; fall back to noble
-        if ! curl -fsSL --head \
-                "${ZREPL_BASE}/dists/${ZREPL_SUITE}/InRelease" \
-                -o /dev/null 2>/dev/null; then
-            echo "[INFO] zrepl repo has no packages for ${ZREPL_SUITE}, using noble"
-            ZREPL_SUITE="noble"
-        fi
-        echo "deb ${ZREPL_BASE}/ ${ZREPL_SUITE} main" \
-            > /etc/apt/sources.list.d/zrepl.list
+    ZREPL_KEY_URL="https://zrepl.cschwarz.com/apt/apt-key.asc"
+    ZREPL_KEY_DST="/usr/share/keyrings/zrepl.gpg"
+    ZREPL_REPO_FILE="/etc/apt/sources.list.d/zrepl.list"
+    ZREPL_ARCH="\$(dpkg --print-architecture)"
+    # Repo path format: "ubuntu noble" (distro-lowercase space codename-lowercase)
+    ZREPL_CODENAME="ubuntu ${SUITE}"
+    if curl -fsSL "\$ZREPL_KEY_URL" | gpg --dearmor > "\$ZREPL_KEY_DST" 2>/dev/null; then
+        echo "deb [arch=\$ZREPL_ARCH signed-by=\$ZREPL_KEY_DST] https://zrepl.cschwarz.com/apt/\$ZREPL_CODENAME main" \
+            > "\$ZREPL_REPO_FILE"
         apt-get update -qq 2>/dev/null || true
         apt-get install -y zrepl 2>/dev/null \
             || echo "[WARNING] zrepl install failed, skipping"
