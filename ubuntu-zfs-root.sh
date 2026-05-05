@@ -874,9 +874,11 @@ create_datasets() {
 
     # ZFS swap zvol (when not using LUKS partition swap)
     if [[ "$DISCENC" != "LUKS" && "${SIZE_SWAP:-0}" -gt 0 ]]; then
+        # volblocksize 16384: ZFS warns if < 16384 due to metadata overhead.
+        # 4096 (page size) causes a visible warning without meaningful benefit.
         zfs create \
             -V "${SIZE_SWAP}M" \
-            -b "$(getconf PAGESIZE)" \
+            -b 16384 \
             -o compression=zle \
             -o logbias=throughput \
             -o sync=always \
@@ -891,17 +893,24 @@ create_datasets() {
     # Home datasets
     if [[ "$DISCENC" == "ZFSENC" ]]; then
         mkdir -p /mnt/etc/zfs
-        # Separate home encryption key (safe inside encrypted root)
-        dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 \
+
+        # Generate a 32-byte random key (binary, keyformat=raw).
+        # Must be exactly 32 bytes — do NOT pipe through base64.
+        dd if=/dev/urandom bs=32 count=1 2>/dev/null \
             > /mnt/etc/zfs/zroot.homekey
         chmod 400 /mnt/etc/zfs/zroot.homekey
 
+        # keylocation must point to the HOST path (/mnt/…) at creation time
+        # because zfs runs on the host and opens the file directly.
+        # After creation, update to the in-chroot path so the installed system
+        # can load the key from /etc/zfs/zroot.homekey on every boot.
         zfs create \
             -o canmount=off \
             -o encryption=on \
-            -o keylocation="file:///etc/zfs/zroot.homekey" \
+            -o keylocation="file:///mnt/etc/zfs/zroot.homekey" \
             -o keyformat=raw \
             "${pool}/home"
+        zfs set keylocation="file:///etc/zfs/zroot.homekey" "${pool}/home"
     else
         zfs create -o canmount=off "${pool}/home"
     fi
