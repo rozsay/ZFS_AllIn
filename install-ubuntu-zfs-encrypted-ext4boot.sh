@@ -838,6 +838,7 @@ Suites: noble-security
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 EOF
+
 # Disable IPv6 system-wide
 cat > /mnt/etc/sysctl.d/99-disable-ipv6.conf <<EOF
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -988,7 +989,7 @@ if [[ "$BOOT_MODE" == "UEFI" ]]; then
             --efi-directory=/boot/efi \
             --bootloader-id=ubuntu \
             --recheck
-        log_info "GRUB installed on EFI: ${EFI_PARTS[$i]}"
+        # log_info "GRUB installed on EFI: ${EFI_PARTS[$i]}"
     done
     # Leave primary EFI mounted for update-grub
     if [[ "${#EFI_PARTS[@]}" -gt 1 ]]; then
