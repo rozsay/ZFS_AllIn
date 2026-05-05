@@ -326,7 +326,7 @@ cleanup_trap() {
     done
 }
 trap cleanup_trap EXIT
-cleanup_mounts
+cleanup_mounts() {
     log_step "Pre-installation teardown"
     umount -R /mnt/dev  2>/dev/null || true
     umount -R /mnt/proc 2>/dev/null || true
