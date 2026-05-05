@@ -951,13 +951,13 @@ EOF
     # APT sources
     cat > /mnt/etc/apt/sources.list.d/ubuntu.sources <<EOF
 Types: deb
-URIs: http://archive.ubuntu.com/ubuntu/
+URIs: http://de.archive.ubuntu.com/ubuntu/
 Suites: ${SUITE} ${SUITE}-updates ${SUITE}-backports
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
 Types: deb
-URIs: http://security.ubuntu.com/ubuntu/
+URIs: http://de.security.ubuntu.com/ubuntu/
 Suites: ${SUITE}-security
 Components: main universe restricted multiverse
 Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
