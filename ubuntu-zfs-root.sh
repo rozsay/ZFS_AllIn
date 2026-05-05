@@ -327,38 +327,14 @@ cleanup_trap() {
 }
 trap cleanup_trap EXIT
 cleanup_mounts() {
-    log_step "Pre-installation teardown"
-    umount -R /mnt/dev  2>/dev/null || true
-    umount -R /mnt/proc 2>/dev/null || true
-    umount -R /mnt/sys  2>/dev/null || true
-    umount -R /mnt      2>/dev/null || true
-
-    for dev in /dev/mapper/luks-* /dev/mapper/cryptswap*; do
-        [[ -b "$dev" ]] && cryptsetup close "$dev" 2>/dev/null || true
-    done
-
-    zfs umount -a 2>/dev/null || true
-
-    local existing
-    existing=$(zpool list -H -o name 2>/dev/null || true)
-    if [[ -n "$existing" ]]; then
-        local ptext=""
-        while IFS= read -r p; do ptext+="  $p\n"; done <<< "$existing"
-        if wt_yesno "Existing ZFS Pools" \
-"Found existing ZFS pools:\n\n${ptext}\nDestroy all and continue?" "true"; then
-            while IFS= read -r pool; do
-                zpool export -f "$pool" 2>/dev/null || true
-                zpool destroy -f "$pool" 2>/dev/null || true
-                log_info "Destroyed pool: $pool"
-            done <<< "$existing"
-        else
-            die "Cannot continue with existing pools. Destroy them manually."
+    log_step "Cleaning up mount points..."
+    # A sorrend fontos: mélyről kifelé
+    for target in /mnt/sys/fs/cgroup /mnt/sys/firmware/efi/efivars /mnt/sys /mnt/dev/pts /mnt/dev /mnt/proc; do
+        if mountpoint -q "$target"; then
+            umount -l "$target" || true
         fi
-    fi
-
-    mdadm --stop --scan 2>/dev/null || true
-    udevadm settle --timeout=15
-    log_success "Teardown complete"
+    done
+    log_success "Cleaning up mount points complete"
 }
 
 ###############################################################################
