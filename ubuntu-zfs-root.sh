@@ -1469,6 +1469,23 @@ _efi_bootmgr_entry() {
 install_bootloader() {
     log_step "Installing bootloader"
 
+    # Ensure /boot and /boot/efi are mounted — restore_environment may have
+    # failed silently if the pool altroot was wrong; we die here rather than
+    # letting grub-install produce a cryptic "unknown filesystem" error.
+    if ! mountpoint -q /mnt/boot 2>/dev/null; then
+        [[ ${#BOOT_PARTS[@]} -gt 0 && -b "${BOOT_PARTS[0]}" ]] \
+            || die "BOOT_PARTS empty — run from step 1"
+        mount "${BOOT_PARTS[0]}" /mnt/boot \
+            || die "Cannot mount ${BOOT_PARTS[0]} at /mnt/boot"
+    fi
+    if [[ "$BOOT_MODE" == "UEFI" ]] && ! mountpoint -q /mnt/boot/efi 2>/dev/null; then
+        mkdir -p /mnt/boot/efi
+        [[ ${#EFI_PARTS[@]} -gt 0 && -b "${EFI_PARTS[0]}" ]] \
+            || die "EFI_PARTS empty — run from step 1"
+        mount "${EFI_PARTS[0]}" /mnt/boot/efi \
+            || die "Cannot mount ${EFI_PARTS[0]} at /mnt/boot/efi"
+    fi
+
     chroot /mnt update-initramfs -c -k all
 
     if [[ "$BOOT_MODE" == "UEFI" ]]; then
@@ -1754,8 +1771,20 @@ restore_environment() {
 
     # After create_pool (step 4): import pool and mount datasets
     if [[ "$from_num" -gt 4 && -n "${POOLNAME:-}" ]]; then
+        # If the pool is already imported but without -R /mnt, datasets mount
+        # at their absolute mountpoints (e.g. /) instead of /mnt.  Re-export
+        # and re-import with the correct alternate root.
+        if zpool list "$POOLNAME" &>/dev/null; then
+            local _altroot
+            _altroot=$(zpool get -H -o value altroot "$POOLNAME" 2>/dev/null || true)
+            if [[ "$_altroot" != "/mnt" ]]; then
+                log_info "Pool altroot is '${_altroot}', re-importing with -R /mnt..."
+                zpool export "$POOLNAME" 2>/dev/null || true
+            fi
+        fi
+
         if ! zpool list "$POOLNAME" &>/dev/null; then
-            log_info "Re-importing pool '$POOLNAME'..."
+            log_info "Importing pool '$POOLNAME' with altroot /mnt..."
 
             # Re-open LUKS devices if needed
             if [[ "${DISCENC:-}" == "LUKS" && ${#ROOT_PARTS[@]} -gt 0 ]]; then
@@ -1776,12 +1805,13 @@ restore_environment() {
 
             zpool import -R /mnt -f "$POOLNAME" 2>/dev/null \
                 || zpool import -R /mnt -d /dev/disk/by-id "$POOLNAME" 2>/dev/null \
-                || log_warning "Could not import $POOLNAME — may already be imported"
+                || die "Could not import pool '$POOLNAME' — run from step 1"
 
             if [[ "${DISCENC:-}" == "ZFSENC" ]]; then
                 echo -n "${PASSPHRASE:-}" | zfs load-key -a 2>/dev/null || true
             fi
         fi
+        zfs mount "${POOLNAME}/ROOT/${SUITE}" 2>/dev/null || true
         zfs mount -a 2>/dev/null || true
     fi
 
@@ -1790,15 +1820,19 @@ restore_environment() {
         if ! mountpoint -q /mnt/boot 2>/dev/null; then
             mkdir -p /mnt/boot
             if [[ ${#BOOT_PARTS[@]} -gt 0 && -b "${BOOT_PARTS[0]:-}" ]]; then
-                mount "${BOOT_PARTS[0]}" /mnt/boot 2>/dev/null \
-                    || log_warning "Could not mount /mnt/boot"
+                mount "${BOOT_PARTS[0]}" /mnt/boot \
+                    || die "Could not mount ${BOOT_PARTS[0]} at /mnt/boot"
+            else
+                die "BOOT_PARTS not set — cannot mount /mnt/boot, run from step 1"
             fi
         fi
-        if [[ "${BOOT_MODE:-}" == "UEFI" ]] && ! mountpoint -q /mnt/boot/efi 2>/dev/null; then
+        if [[ "${BOOT_MODE:-UEFI}" == "UEFI" ]] && ! mountpoint -q /mnt/boot/efi 2>/dev/null; then
             mkdir -p /mnt/boot/efi
             if [[ ${#EFI_PARTS[@]} -gt 0 && -b "${EFI_PARTS[0]:-}" ]]; then
-                mount "${EFI_PARTS[0]}" /mnt/boot/efi 2>/dev/null \
-                    || log_warning "Could not mount /mnt/boot/efi"
+                mount "${EFI_PARTS[0]}" /mnt/boot/efi \
+                    || die "Could not mount ${EFI_PARTS[0]} at /mnt/boot/efi"
+            else
+                die "EFI_PARTS not set — cannot mount /mnt/boot/efi, run from step 1"
             fi
         fi
     fi
@@ -1914,15 +1948,21 @@ cmd_initial() {
 
         log_info "Starting from step ${start_num}"
 
-        # Load environment from prior completed steps, discard stale state
-        # from this step onwards so it will be re-run fresh.
-        load_state_up_to "$start_num"
-        clear_state_from  "$start_num"
-
-        # First step: run teardown to ensure a clean slate
         if [[ "$start_num" -eq 1 ]]; then
+            # Full fresh start: confirm, wipe all saved state, teardown pools
+            wt_yesno "Full fresh installation" \
+"Starting from Step 1 will:
+  • Delete ALL saved step state
+  • Destroy any existing ZFS pools on the target disks
+  • Repartition and reinstall from scratch
+
+Are you sure?" "true" || { log_info "Cancelled."; exit 0; }
+            clear_state_from 1
             do_teardown
         else
+            # Partial resume: load prior state, clear from chosen step onwards
+            load_state_up_to "$start_num"
+            clear_state_from  "$start_num"
             restore_environment "$start_num"
         fi
 
