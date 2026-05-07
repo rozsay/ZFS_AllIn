@@ -1334,7 +1334,8 @@ EOF
     # and will find the already-valid authorized_keys
     chroot /mnt /bin/bash -e <<'DROPBEAR_INSTALL'
 export DEBIAN_FRONTEND=noninteractive
-apt-get install -y dropbear-initramfs
+# --force-confold: dpkg keeps our pre-written dropbear.conf without prompting
+apt-get install -y -o Dpkg::Options::="--force-confold" dropbear-initramfs
 DROPBEAR_INSTALL
 
     # zfsunlock helper script (used inside the initramfs SSH session)
