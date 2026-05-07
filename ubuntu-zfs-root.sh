@@ -1294,6 +1294,26 @@ configure_dropbear() {
     # and does not emit "Invalid authorized_keys" warnings.
     mkdir -p /mnt/etc/dropbear/initramfs
 
+    # Guard: if an earlier run wrote the old multi-line apt hook (which APT's
+    # config parser rejects with "Malformed tag"), rewrite it to the correct
+    # single-line format before any apt operation runs in the chroot.
+    local _hook=/mnt/etc/apt/apt.conf.d/60-zfs-snapshot
+    local _snap=/mnt/usr/local/bin/zfs-apt-snapshot
+    if [[ -f "$_hook" ]] && ! grep -qF '/usr/local/bin/zfs-apt-snapshot' "$_hook"; then
+        printf 'DPkg::Pre-Invoke { "/usr/local/bin/zfs-apt-snapshot"; };\n' > "$_hook"
+        log_info "Fixed apt pre-invoke hook format"
+    fi
+    if [[ ! -x "$_snap" ]]; then
+        cat > "$_snap" <<SNAP
+#!/bin/sh
+dataset="${POOLNAME}/ROOT/${SUITE}"
+zfs list "\$dataset" >/dev/null 2>&1 || exit 0
+zfs snapshot "\${dataset}@apt_\$(date +%Y-%m-%d-%H%M%S)" 2>/dev/null || true
+SNAP
+        chmod +x "$_snap"
+        log_info "Created zfs-apt-snapshot wrapper"
+    fi
+
     # Write authorized_keys BEFORE installing the package
     if [[ -n "${SSHPUBKEY:-}" ]]; then
         echo "$SSHPUBKEY" > /mnt/etc/dropbear/initramfs/authorized_keys
