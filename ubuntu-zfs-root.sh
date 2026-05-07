@@ -907,7 +907,14 @@ create_datasets() {
             -o secondarycache=none \
             -o com.sun:auto-snapshot=false \
             "${pool}/swap"
-        mkswap -f "/dev/zvol/${pool}/swap"
+        # The zvol device node is created asynchronously by udev; wait for it.
+        local _zvol="/dev/zvol/${pool}/swap"
+        udevadm settle --timeout=30 2>/dev/null || true
+        if [[ ! -b "$_zvol" ]]; then
+            udevadm trigger 2>/dev/null || true
+            wait_for_dev "$_zvol" 30
+        fi
+        mkswap -f "$_zvol"
         log_info "ZFS swap zvol: ${pool}/swap"
     fi
 
