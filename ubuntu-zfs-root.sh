@@ -1101,6 +1101,14 @@ EOF
     touch /mnt/etc/zfs/vdev_id.conf
     touch /mnt/etc/zfs/initramfs-tools-load-key
     mkdir -p /mnt/etc/zfs/initramfs-tools-load-key.d
+    # mkinitramfs copies files matching the glob initramfs-tools-load-key.d/*
+    # and warns "not found" when the directory is empty.  A no-op placeholder
+    # satisfies the glob without having any effect at boot.
+    cat > /mnt/etc/zfs/initramfs-tools-load-key.d/no-op <<'EOF'
+#!/bin/sh
+# Placeholder — ZFS AllIn does not use custom key-load hooks.
+EOF
+    chmod +x /mnt/etc/zfs/initramfs-tools-load-key.d/no-op
 
     log_success "Pre-chroot config done"
 }
@@ -1599,13 +1607,27 @@ save_system_info() {
 do_cleanup() {
     log_step "Unmounting and exporting pool"
     CLEANUP_DONE=1
-    umount -R /mnt/dev  2>/dev/null || true
-    umount -R /mnt/proc 2>/dev/null || true
-    umount -R /mnt/sys  2>/dev/null || true
-    [[ "$BOOT_MODE" == "UEFI" ]] && umount /mnt/boot/efi 2>/dev/null || true
+
+    # Use lazy unmount (-l) for bind mounts: they detach from the directory
+    # immediately even if a process inside still has open file descriptors,
+    # preventing "target is busy" from blocking the subsequent zfs umount.
+    umount -Rl /mnt/dev  2>/dev/null || true
+    umount -Rl /mnt/proc 2>/dev/null || true
+    umount -Rl /mnt/sys  2>/dev/null || true
+
+    if [[ "$BOOT_MODE" == "UEFI" ]]; then
+        umount /mnt/boot/efi 2>/dev/null || true
+    fi
     umount /mnt/boot 2>/dev/null || true
-    zfs umount -a
-    zpool export "$POOLNAME"
+
+    sync
+    zfs umount -a 2>/dev/null || true
+    if ! zpool export "$POOLNAME" 2>/dev/null; then
+        log_warning "Regular export failed — trying force export"
+        zpool export -f "$POOLNAME" \
+            || log_warning "Force export also failed; pool may still be imported"
+    fi
+
     for dev in /dev/mapper/luks-*; do
         [[ -b "$dev" ]] && cryptsetup close "$dev" 2>/dev/null || true
     done
