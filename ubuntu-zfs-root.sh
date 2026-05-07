@@ -1708,7 +1708,7 @@ restore_environment() {
             log_info "Re-importing pool '$POOLNAME'..."
 
             # Re-open LUKS devices if needed
-            if [[ "${DISCENC:-}" == "LUKS" && ${#ROOT_PARTS[@]:-0} -gt 0 ]]; then
+            if [[ "${DISCENC:-}" == "LUKS" && ${#ROOT_PARTS[@]} -gt 0 ]]; then
                 local i part uuid mapper
                 for i in "${!ROOT_PARTS[@]}"; do
                     part="${ROOT_PARTS[$i]}"
@@ -1739,14 +1739,14 @@ restore_environment() {
     if [[ "$from_num" -gt 6 ]]; then
         if ! mountpoint -q /mnt/boot 2>/dev/null; then
             mkdir -p /mnt/boot
-            if [[ ${#BOOT_PARTS[@]:-0} -gt 0 && -b "${BOOT_PARTS[0]:-}" ]]; then
+            if [[ ${#BOOT_PARTS[@]} -gt 0 && -b "${BOOT_PARTS[0]:-}" ]]; then
                 mount "${BOOT_PARTS[0]}" /mnt/boot 2>/dev/null \
                     || log_warning "Could not mount /mnt/boot"
             fi
         fi
         if [[ "${BOOT_MODE:-}" == "UEFI" ]] && ! mountpoint -q /mnt/boot/efi 2>/dev/null; then
             mkdir -p /mnt/boot/efi
-            if [[ ${#EFI_PARTS[@]:-0} -gt 0 && -b "${EFI_PARTS[0]:-}" ]]; then
+            if [[ ${#EFI_PARTS[@]} -gt 0 && -b "${EFI_PARTS[0]:-}" ]]; then
                 mount "${EFI_PARTS[0]}" /mnt/boot/efi 2>/dev/null \
                     || log_warning "Could not mount /mnt/boot/efi"
             fi
