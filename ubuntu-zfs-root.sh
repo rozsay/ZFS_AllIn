@@ -1668,27 +1668,39 @@ _state_file() {
 }
 
 # Save all runtime arrays and important scalars to a per-step state file.
+# Uses "declare -g" so that sourcing the file inside a function restores
+# variables to the global scope rather than creating function-local copies.
 save_step_state() {
     local num="$1" key="$2"
     mkdir -p "$STATE_DIR"
     local sf; sf=$(_state_file "$num" "$key")
+    # _gdecl: emit a "declare -g" line for the named variable.
+    # Transforms:  declare -a VAR → declare -ga VAR
+    #              declare -- VAR → declare -g  VAR
+    _gdecl() {
+        declare -p "$1" 2>/dev/null \
+            | sed 's/^declare -- /declare -g /; s/^declare -\([a-z]\)/declare -g\1/' \
+            || true
+    }
     {
         for var in DISKS DISK_IDS EFI_PARTS BOOT_PARTS SWAP_PARTS \
                    ROOT_PARTS ROOT_IDS LUKS_DEVS; do
-            declare -p "$var" 2>/dev/null || true
+            _gdecl "$var"
         done
         for var in BOOT_MODE ZFS_PART_NUM POOL_CREATED POOLNAME SUITE \
                    DISCENC RAIDLEVEL USERNAME UCOMMENT MYHOSTNAME SIZE_SWAP \
                    PASSPHRASE DROPBEAR RESCUE GOOGLE HWE ZREPL NVIDIA \
                    WIPE_FRESH NECESSARY_PACKAGES SSHPUBKEY \
                    NET_MODE NET_IP NET_GW NET_DNS TIMEZONE; do
-            declare -p "$var" 2>/dev/null || true
+            _gdecl "$var"
         done
     } > "$sf"
     log_debug "State saved: $(basename "$sf")"
 }
 
 # Source state files for all steps strictly before target_num.
+# Applies the same declare → declare -g transformation so that old state
+# files written without -g are also loaded into the global scope.
 load_state_up_to() {
     local target_num="$1"
     local sf snum
@@ -1697,8 +1709,9 @@ load_state_up_to() {
         snum=$(basename "$sf" | sed 's/step-0*\([0-9][0-9]*\)-.*/\1/')
         if [[ "$snum" -lt "$target_num" ]]; then
             log_debug "Loading state: $(basename "$sf")"
-            # shellcheck disable=SC1090
-            source "$sf"
+            # eval + sed ensures -g flag regardless of how the file was written
+            # shellcheck disable=SC2005
+            eval "$(sed 's/^declare -- /declare -g /; s/^declare -\([a-z]\)/declare -g\1/' "$sf")"
         fi
     done
 }
