@@ -97,6 +97,7 @@ BOOT_MODE="UEFI"
 ZFS_PART_NUM=3
 POOL_CREATED=0
 CLEANUP_DONE=0
+STATE_DIR="/var/lib/zfs-allin/state"
 
 ###############################################################################
 # Colors
@@ -128,7 +129,7 @@ log_step()    { echo -e "\n${BOLD}${CYAN}━━━ $1 ━━━${NC}"; }
 log_debug()   { [[ "${DEBUG:-0}" == "1" ]] && _log "DEBUG  " "$YELLOW" "$1" || true; }
 
 ###############################################################################
-# Config file loading
+# Config file loading / saving
 ###############################################################################
 load_config() {
     local cfg="${1:-$CONFIG_FILE}"
@@ -137,6 +138,50 @@ load_config() {
         # shellcheck disable=SC1090
         source "$cfg"
     fi
+}
+
+# save_config — write all user-settable variables back to ZFS-root.conf.
+# Uses printf '%q' so any special character in passwords / keys is preserved.
+save_config() {
+    local cfg="${CONFIG_FILE}"
+    log_info "Saving configuration to $cfg"
+    _q() { printf '%q' "$1"; }
+    {
+        printf '# ZFS_AllIn — ZFS-root.conf  (auto-saved %s)\n' "$(date)"
+        printf '# Edit variables then re-run: sudo bash ubuntu-zfs-root.sh initial\n\n'
+        printf 'WIPE_FRESH=%s\n'            "$(_q "$WIPE_FRESH")"
+        printf 'SUITE=%s\n'                "$(_q "$SUITE")"
+        printf 'MYHOSTNAME=%s\n'           "$(_q "$MYHOSTNAME")"
+        printf 'POOLNAME=%s\n'             "$(_q "$POOLNAME")"
+        printf 'USERNAME=%s\n'             "$(_q "$USERNAME")"
+        printf 'UCOMMENT=%s\n'             "$(_q "$UCOMMENT")"
+        printf 'UPASSWORD=%s\n'            "$(_q "$UPASSWORD")"
+        printf 'SIZE_SWAP=%s\n'            "$SIZE_SWAP"
+        printf 'RAIDLEVEL=%s\n'            "$(_q "$RAIDLEVEL")"
+        printf 'DISCENC=%s\n'              "$(_q "$DISCENC")"
+        printf 'PASSPHRASE=%s\n'           "$(_q "$PASSPHRASE")"
+        printf 'DROPBEAR=%s\n'             "$(_q "$DROPBEAR")"
+        printf 'RESCUE=%s\n'               "$(_q "$RESCUE")"
+        printf 'GOOGLE=%s\n'               "$(_q "$GOOGLE")"
+        printf 'HWE=%s\n'                 "$(_q "$HWE")"
+        printf 'ZREPL=%s\n'               "$(_q "$ZREPL")"
+        printf 'NVIDIA=%s\n'              "$(_q "$NVIDIA")"
+        printf 'NECESSARY_PACKAGES=%s\n'  "$(_q "$NECESSARY_PACKAGES")"
+        printf 'SSHPUBKEY=%s\n'           "$(_q "$SSHPUBKEY")"
+        printf 'HOST_ECDSA_KEY=%s\n'      "$(_q "$HOST_ECDSA_KEY")"
+        printf 'HOST_ECDSA_KEY_PUB=%s\n'  "$(_q "$HOST_ECDSA_KEY_PUB")"
+        printf 'HOST_RSA_KEY=%s\n'        "$(_q "$HOST_RSA_KEY")"
+        printf 'HOST_RSA_KEY_PUB=%s\n'    "$(_q "$HOST_RSA_KEY_PUB")"
+        printf 'HOST_ED25519_KEY=%s\n'    "$(_q "$HOST_ED25519_KEY")"
+        printf 'HOST_ED25519_KEY_PUB=%s\n' "$(_q "$HOST_ED25519_KEY_PUB")"
+        printf 'NET_MODE=%s\n'            "$(_q "$NET_MODE")"
+        printf 'NET_IP=%s\n'              "$(_q "$NET_IP")"
+        printf 'NET_GW=%s\n'              "$(_q "$NET_GW")"
+        printf 'NET_DNS=%s\n'             "$(_q "$NET_DNS")"
+        printf 'TIMEZONE=%s\n'            "$(_q "$TIMEZONE")"
+        printf 'LOGDIR=%s\n'              "$(_q "$LOGDIR")"
+    } > "$cfg"
+    log_success "Config saved: $cfg"
 }
 
 ###############################################################################
@@ -1565,45 +1610,273 @@ Destroy it and reinstall?" "true" || die "Aborted."
 }
 
 ###############################################################################
+# Step definitions (used by step-by-step execution in cmd_initial)
+###############################################################################
+# Parallel arrays: number, short key (used in filenames), display description.
+STEP_NUMS=(1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16 17 18 19)
+STEP_KEYS=(
+    "select_disks"    "partition_disks"   "setup_luks"
+    "create_pool"     "create_datasets"   "setup_boot"
+    "install_base"    "prechroot"         "bind_mounts"
+    "install_pkgs"    "setup_user"        "sanoid"
+    "dropbear"        "zrepl"             "bootloader"
+    "zfs_services"    "base_snapshots"    "sysinfo"
+    "cleanup"
+)
+STEP_DESCS=(
+    "Select disks for pool"      "Partition disks"            "Setup LUKS encryption"
+    "Create ZFS root pool"       "Create ZFS datasets"        "Setup boot partitions"
+    "Install base system"        "Pre-chroot configuration"   "Bind /dev /proc /sys"
+    "Install packages (chroot)"  "Create user account"        "Configure Sanoid"
+    "Configure Dropbear SSH"     "Configure zrepl"            "Install bootloader (GRUB)"
+    "Enable ZFS services"        "Create base snapshots"      "Save system info"
+    "Cleanup and export pool"
+)
+
+###############################################################################
+# Step state management
+###############################################################################
+_state_file() {
+    printf '%s/step-%02d-%s.state' "$STATE_DIR" "$1" "$2"
+}
+
+# Save all runtime arrays and important scalars to a per-step state file.
+save_step_state() {
+    local num="$1" key="$2"
+    mkdir -p "$STATE_DIR"
+    local sf; sf=$(_state_file "$num" "$key")
+    {
+        for var in DISKS DISK_IDS EFI_PARTS BOOT_PARTS SWAP_PARTS \
+                   ROOT_PARTS ROOT_IDS LUKS_DEVS; do
+            declare -p "$var" 2>/dev/null || true
+        done
+        for var in BOOT_MODE ZFS_PART_NUM POOL_CREATED POOLNAME SUITE \
+                   DISCENC RAIDLEVEL USERNAME UCOMMENT MYHOSTNAME SIZE_SWAP \
+                   PASSPHRASE DROPBEAR RESCUE GOOGLE HWE ZREPL NVIDIA \
+                   WIPE_FRESH NECESSARY_PACKAGES SSHPUBKEY \
+                   NET_MODE NET_IP NET_GW NET_DNS TIMEZONE; do
+            declare -p "$var" 2>/dev/null || true
+        done
+    } > "$sf"
+    log_debug "State saved: $(basename "$sf")"
+}
+
+# Source state files for all steps strictly before target_num.
+load_state_up_to() {
+    local target_num="$1"
+    local sf snum
+    for sf in "$STATE_DIR"/step-*.state; do
+        [[ -f "$sf" ]] || continue
+        snum=$(basename "$sf" | sed 's/step-0*\([0-9][0-9]*\)-.*/\1/')
+        if [[ "$snum" -lt "$target_num" ]]; then
+            log_debug "Loading state: $(basename "$sf")"
+            # shellcheck disable=SC1090
+            source "$sf"
+        fi
+    done
+}
+
+# Delete state files for steps >= from_num (they will be re-executed).
+clear_state_from() {
+    local from_num="$1"
+    local sf snum
+    for sf in "$STATE_DIR"/step-*.state; do
+        [[ -f "$sf" ]] || continue
+        snum=$(basename "$sf" | sed 's/step-0*\([0-9][0-9]*\)-.*/\1/')
+        if [[ "$snum" -ge "$from_num" ]]; then
+            rm -f "$sf"
+            log_debug "Cleared state: $(basename "$sf")"
+        fi
+    done
+}
+
+step_has_state() {
+    [[ -f "$(_state_file "$1" "$2")" ]]
+}
+
+# restore_environment — re-import the pool, remount /boot, /boot/efi and bind
+# mounts as required for starting at step from_num without repeating destructive
+# earlier steps (partitioning, pool creation, debootstrap).
+restore_environment() {
+    local from_num="$1"
+    [[ "$from_num" -le 1 ]] && return
+    log_step "Restoring environment for step ${from_num}"
+
+    # After create_pool (step 4): import pool and mount datasets
+    if [[ "$from_num" -gt 4 && -n "${POOLNAME:-}" ]]; then
+        if ! zpool list "$POOLNAME" &>/dev/null; then
+            log_info "Re-importing pool '$POOLNAME'..."
+
+            # Re-open LUKS devices if needed
+            if [[ "${DISCENC:-}" == "LUKS" && ${#ROOT_PARTS[@]:-0} -gt 0 ]]; then
+                local i part uuid mapper
+                for i in "${!ROOT_PARTS[@]}"; do
+                    part="${ROOT_PARTS[$i]}"
+                    [[ -b "$part" ]] || continue
+                    uuid=$(blkid -s UUID -o value "$part" 2>/dev/null || true)
+                    [[ -z "$uuid" ]] && continue
+                    mapper="luks-${uuid}"
+                    if [[ ! -b "/dev/mapper/$mapper" ]]; then
+                        echo -n "${PASSPHRASE:-}" | \
+                            cryptsetup open --key-file - "$part" "$mapper" 2>/dev/null \
+                            || log_warning "Could not re-open LUKS $part"
+                    fi
+                done
+            fi
+
+            zpool import -R /mnt -f "$POOLNAME" 2>/dev/null \
+                || zpool import -R /mnt -d /dev/disk/by-id "$POOLNAME" 2>/dev/null \
+                || log_warning "Could not import $POOLNAME — may already be imported"
+
+            if [[ "${DISCENC:-}" == "ZFSENC" ]]; then
+                echo -n "${PASSPHRASE:-}" | zfs load-key -a 2>/dev/null || true
+            fi
+        fi
+        zfs mount -a 2>/dev/null || true
+    fi
+
+    # After setup_boot_partitions (step 6): mount /boot and /boot/efi
+    if [[ "$from_num" -gt 6 ]]; then
+        if ! mountpoint -q /mnt/boot 2>/dev/null; then
+            mkdir -p /mnt/boot
+            if [[ ${#BOOT_PARTS[@]:-0} -gt 0 && -b "${BOOT_PARTS[0]:-}" ]]; then
+                mount "${BOOT_PARTS[0]}" /mnt/boot 2>/dev/null \
+                    || log_warning "Could not mount /mnt/boot"
+            fi
+        fi
+        if [[ "${BOOT_MODE:-}" == "UEFI" ]] && ! mountpoint -q /mnt/boot/efi 2>/dev/null; then
+            mkdir -p /mnt/boot/efi
+            if [[ ${#EFI_PARTS[@]:-0} -gt 0 && -b "${EFI_PARTS[0]:-}" ]]; then
+                mount "${EFI_PARTS[0]}" /mnt/boot/efi 2>/dev/null \
+                    || log_warning "Could not mount /mnt/boot/efi"
+            fi
+        fi
+    fi
+
+    # After bind_mounts (step 9): re-bind /dev /proc /sys
+    if [[ "$from_num" -gt 9 ]]; then
+        mountpoint -q /mnt/dev  2>/dev/null || mount --rbind /dev  /mnt/dev
+        mountpoint -q /mnt/proc 2>/dev/null || mount --rbind /proc /mnt/proc
+        mountpoint -q /mnt/sys  2>/dev/null || mount --rbind /sys  /mnt/sys
+    fi
+
+    log_success "Environment ready for step ${from_num}"
+}
+
+# Dispatch a single step by number.
+_run_step() {
+    case "$1" in
+        1)  select_disks_for_pool "$RAIDLEVEL" ;;
+        2)  partition_disks ;;
+        3)  setup_luks ;;
+        4)  create_pool ;;
+        5)  create_datasets ;;
+        6)  setup_boot_partitions ;;
+        7)  install_base_system ;;
+        8)  configure_prechroot ;;
+        9)  bind_mounts ;;
+        10) install_packages_chroot ;;
+        11) setup_user ;;
+        12) configure_sanoid ;;
+        13) configure_dropbear ;;
+        14) configure_zrepl ;;
+        15) install_bootloader ;;
+        16) enable_zfs_services ;;
+        17) take_base_snapshots ;;
+        18) save_system_info ;;
+        19) do_cleanup ;;
+    esac
+}
+
+# Build and show the step selection whiptail menu.
+# Prints the selected two-digit tag (e.g. "01", "10") to stdout.
+show_step_menu() {
+    local -a items=()
+    local i num key tag status
+    for i in "${!STEP_NUMS[@]}"; do
+        num="${STEP_NUMS[$i]}"
+        key="${STEP_KEYS[$i]}"
+        tag=$(printf '%02d' "$num")
+        status=""
+        step_has_state "$num" "$key" && status=" [DONE]"
+        items+=("$tag" "${STEP_DESCS[$i]}${status}")
+    done
+
+    whiptail --title "Select Starting Step" --backtitle "$BACKTITLE" \
+        --menu \
+"Choose which step to start (or resume) from.
+All steps BEFORE your selection will be restored from saved state.
+All steps FROM your selection onwards will be (re-)executed.
+
+[DONE] = completed in a previous run" \
+        26 74 19 \
+        "${items[@]}" \
+        3>&1 1>&2 2>&3 \
+        || { log_info "Cancelled."; exit 0; }
+}
+
+# Execute all steps starting from start_num, saving state after each.
+run_steps_from() {
+    local start_num="$1"
+    local i num key
+    local total="${#STEP_NUMS[@]}"
+    for i in "${!STEP_NUMS[@]}"; do
+        num="${STEP_NUMS[$i]}"
+        key="${STEP_KEYS[$i]}"
+        [[ "$num" -lt "$start_num" ]] && continue
+        log_step "Step ${num}/${total}: ${STEP_DESCS[$i]}"
+        _run_step "$num"
+        save_step_state "$num" "$key"
+    done
+}
+
+###############################################################################
 # cmd_initial — full installation from Live USB
 ###############################################################################
 cmd_initial() {
     log_step "ZFS AllIn — Initial Installation"
     check_root
-    check_deps
 
     [[ -d /sys/firmware/efi ]] && BOOT_MODE="UEFI" || BOOT_MODE="BIOS"
     log_info "Boot mode: $BOOT_MODE"
 
-    # Gather any missing config interactively
+    # Always load config first so pre-filled values are available
+    load_config "$CONFIG_FILE"
+
+    # Gather any missing values interactively, then persist the complete config
     if [[ -z "${UPASSWORD:-}" ]]; then
         gather_config_interactive
+        save_config
     fi
 
-    do_teardown
+    check_deps
 
-    if [[ "$WIPE_FRESH" == "y" ]]; then
-        select_disks_for_pool "$RAIDLEVEL"
-        partition_disks
-        [[ "$DISCENC" == "LUKS" ]] && setup_luks
-        create_pool
-        create_datasets
-        setup_boot_partitions
-        install_base_system
-        configure_prechroot
-        bind_mounts
-        install_packages_chroot
-        setup_user
-        configure_sanoid
-        configure_dropbear
-        configure_zrepl
-        install_bootloader
-        enable_zfs_services
-        take_base_snapshots
-        save_system_info
-        do_cleanup
-    else
+    if [[ "$WIPE_FRESH" != "y" ]]; then
         add_dataset_to_existing_pool
+    else
+        # ── Step-by-step execution ──────────────────────────────────────────
+        mkdir -p "$STATE_DIR"
+
+        local sel_tag start_num
+        sel_tag=$(show_step_menu)
+        # Convert "01".."19" to plain integer, forcing decimal interpretation
+        start_num=$((10#$sel_tag))
+
+        log_info "Starting from step ${start_num}"
+
+        # Load environment from prior completed steps, discard stale state
+        # from this step onwards so it will be re-run fresh.
+        load_state_up_to "$start_num"
+        clear_state_from  "$start_num"
+
+        # First step: run teardown to ensure a clean slate
+        if [[ "$start_num" -eq 1 ]]; then
+            do_teardown
+        else
+            restore_environment "$start_num"
+        fi
+
+        run_steps_from "$start_num"
     fi
 
     local enc_note=""
