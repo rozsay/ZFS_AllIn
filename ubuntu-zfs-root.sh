@@ -1263,16 +1263,21 @@ autosnap   = yes
 autoprune  = yes
 EOF
 
-    # APT pre-invoke hook: snapshot root dataset before any apt operation
+    # APT pre-invoke hook: snapshot root dataset before any apt operation.
+    # A wrapper script avoids APT config-string syntax limitations (no line
+    # continuation, no subshell inside quoted config values).
     local snap_dataset="${POOLNAME}/ROOT/${SUITE}"
-    cat > /mnt/etc/apt/apt.conf.d/60-zfs-snapshot <<EOF
-DPkg::Pre-Invoke {
-    "if zfs list ${snap_dataset} > /dev/null 2>&1; then \\
-        zfs snapshot '${snap_dataset}@apt_\$(date +%Y-%m-%d-%H%M%S)' \\
-        2>/dev/null || true; \\
-    fi";
-};
-EOF
+    cat > /mnt/usr/local/bin/zfs-apt-snapshot <<SCRIPT
+#!/bin/sh
+dataset="${snap_dataset}"
+zfs list "\$dataset" >/dev/null 2>&1 || exit 0
+zfs snapshot "\${dataset}@apt_\$(date +%Y-%m-%d-%H%M%S)" 2>/dev/null || true
+SCRIPT
+    chmod +x /mnt/usr/local/bin/zfs-apt-snapshot
+
+    cat > /mnt/etc/apt/apt.conf.d/60-zfs-snapshot <<'APTEOF'
+DPkg::Pre-Invoke { "/usr/local/bin/zfs-apt-snapshot"; };
+APTEOF
 
     log_success "Sanoid configured"
 }
@@ -1294,6 +1299,7 @@ configure_dropbear() {
         echo "$SSHPUBKEY" > /mnt/etc/dropbear/initramfs/authorized_keys
     else
         log_warning "No SSH public key — generating a one-time unlock key pair"
+        rm -f /tmp/dropbear_unlock /tmp/dropbear_unlock.pub
         ssh-keygen -t ed25519 -f /tmp/dropbear_unlock -N "" -C "zfs-allin-unlock" \
             -q 2>/dev/null
         cp /tmp/dropbear_unlock.pub /mnt/etc/dropbear/initramfs/authorized_keys
